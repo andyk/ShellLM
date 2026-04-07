@@ -23,26 +23,29 @@ shell<sup>LM</sup> runs a loop:
 
 The LLM has full shell access. It can curl APIs, parse data with jq, write Python scripts, call itself recursively, install packages — whatever it takes to solve the task.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/andyk/shelllm/master/shelllm -o /usr/local/bin/shelllm && chmod +x /usr/local/bin/shelllm
+```
+
 ## Quick start
 
 ```bash
-# Prerequisites: bash, jq, curl
-# Optional: Docker (auto-detected, used for sandboxing)
-
 # Set your API key
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Run it
-./shelllm what is the mass of jupiter in kilograms
+shelllm what is the mass of jupiter in kilograms
 
 # Pipe data in
-cat dataset.csv | ./shelllm summarize this data and find outliers
+cat dataset.csv | shelllm summarize this data and find outliers
 
 # Pass files
-./shelllm -f paper.pdf -f notes.txt compare these documents
+shelllm -f paper.pdf -f notes.txt compare these documents
 
 # Quotes are optional for inline context
-./shelllm research the latest advances in protein folding and write a summary
+shelllm research the latest advances in protein folding and write a summary
 ```
 
 ## What you see
@@ -281,4 +284,8 @@ shelllm (host)
 ```
 
 Single file. No dependencies beyond bash, jq, and curl. ~820 lines.
+
+## Acknowledgements
+
+shell<sup>LM</sup> is a port of [Recursive Language Models (RLM)](https://alexzhang13.github.io/blog/2025/rlm/) by Alex Zhang to bash, for bash.
 
