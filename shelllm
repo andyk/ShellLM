@@ -288,25 +288,34 @@ call_claude() {
             messages: $messages
         }')
 
-    # Stream response from API
-    local text_file
+    # Stream response from API while also capturing the raw body so we can
+    # report non-SSE HTTP errors clearly.
+    local text_file raw_file headers_file http_code_file err_file body_pipe
     text_file=$(mktemp)
+    raw_file=$(mktemp)
+    headers_file=$(mktemp)
+    http_code_file=$(mktemp)
+    err_file=$(mktemp)
+    body_pipe=$(mktemp -u)
+    mkfifo "$body_pipe"
     local _stream_block=""
     local _stream_error=""
     local _got_events=0
+    local _code_fence_count=0   # track ``` fences in text to detect first block close
+
+    curl -sS -N \
+        -D "$headers_file" \
+        -o >(tee "$raw_file" > "$body_pipe") \
+        -w '%{http_code}' \
+        "$SHELLLM_API_URL" \
+        -H "content-type: application/json" \
+        -H "x-api-key: $ANTHROPIC_API_KEY" \
+        -H "anthropic-version: 2023-06-01" \
+        -d "$payload" >"$http_code_file" 2>"$err_file" &
+    local curl_pid=$!
 
     while IFS= read -r raw_line; do
         local line="${raw_line%$'\r'}"
-
-        # HTTP code sentinel (appended by curl -w)
-        if [[ "$line" == __HTTP__* ]]; then
-            local http_code="${line#__HTTP__}"
-            if [[ "$http_code" -ge 400 ]]; then
-                rm -f "$text_file"
-                die "Claude API error (HTTP $http_code)"
-            fi
-            continue
-        fi
 
         # Only process SSE data lines
         [[ "$line" != data:\ * ]] && continue
@@ -328,7 +337,22 @@ call_claude() {
                 if [[ "$_stream_block" == "thinking" ]]; then
                     printf '%s' "$json" | jq -j '.delta.thinking // empty' >&2
                 elif [[ "$_stream_block" == "text" ]]; then
-                    printf '%s' "$json" | jq -j '.delta.text // empty' | tee -a "$text_file" >&2
+                    local _chunk
+                    _chunk=$(printf '%s' "$json" | jq -j '.delta.text // empty')
+                    if [[ -n "$_chunk" ]]; then
+                        printf '%s' "$_chunk" >> "$text_file"
+                        printf '%s' "$_chunk" >&2
+                        # Count ``` fences to detect when first code block closes.
+                        # After 2 fences (open + close), stop reading — the first
+                        # block is complete. Curl gets SIGPIPE and exits.
+                        local _fence_matches
+                        _fence_matches=$(printf '%s' "$_chunk" | grep -c '```' || true)
+                        _code_fence_count=$(( _code_fence_count + _fence_matches ))
+                        if [[ $_code_fence_count -ge 2 ]]; then
+                            printf '\n' >&2
+                            break
+                        fi
+                    fi
                 fi
                 ;;
             *'"content_block_stop"'*)
@@ -341,26 +365,60 @@ call_claude() {
                 _stream_error=$(printf '%s' "$json" | jq -r '.error.message // "unknown error"')
                 ;;
         esac
-    done < <(curl -sN -w "\n__HTTP__%{http_code}" \
-        "$SHELLLM_API_URL" \
-        -H "content-type: application/json" \
-        -H "x-api-key: $ANTHROPIC_API_KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        -d "$payload" 2>/dev/null)
+    done <"$body_pipe"
+
+    wait "$curl_pid"
+    local curl_rc=$?
+    local http_code curl_err error_message
+    http_code=$(cat "$http_code_file" 2>/dev/null || true)
+    curl_err=$(cat "$err_file" 2>/dev/null || true)
+
+    rm -f "$body_pipe" "$headers_file" "$http_code_file" "$err_file"
+
+    if [[ "$curl_rc" -ne 0 ]]; then
+        # If we already captured a complete first code block, curl may exit with
+        # SIGPIPE because we intentionally stopped reading the stream early.
+        if [[ "$_code_fence_count" -ge 2 && "$curl_rc" -eq 56 ]]; then
+            curl_rc=0
+        fi
+    fi
+
+    if [[ "$curl_rc" -ne 0 ]]; then
+        rm -f "$text_file" "$raw_file"
+        if [[ -n "$curl_err" ]]; then
+            die "Claude API call failed: $curl_err"
+        fi
+        die "Claude API call failed (curl exit $curl_rc). Is the network available?"
+    fi
+
+    if [[ -n "$http_code" && "$http_code" -ge 400 ]]; then
+        error_message=$(jq -r '.error.message // .message // empty' "$raw_file" 2>/dev/null || true)
+        rm -f "$text_file" "$raw_file"
+        if [[ -n "$error_message" ]]; then
+            die "Claude API error (HTTP $http_code): $error_message"
+        fi
+        die "Claude API error (HTTP $http_code)"
+    fi
 
     # Error handling
     if [[ "$_got_events" -eq 0 ]]; then
-        rm -f "$text_file"
-        die "Claude API call failed (curl error). Is the network available?"
+        local fallback_text
+        fallback_text=$(jq -r '.content[]? | select(.type == "text") | .text' "$raw_file" 2>/dev/null || true)
+        if [[ -n "$fallback_text" ]]; then
+            printf '%s' "$fallback_text" > "$text_file"
+        else
+            rm -f "$text_file" "$raw_file"
+            die "Claude API call returned no SSE events and no text response"
+        fi
     fi
     if [[ -n "$_stream_error" ]]; then
-        rm -f "$text_file"
+        rm -f "$text_file" "$raw_file"
         die "Claude API error: $_stream_error"
     fi
 
     # Return collected text response (same interface as before)
     cat "$text_file"
-    rm -f "$text_file"
+    rm -f "$text_file" "$raw_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -403,11 +461,16 @@ build_system_prompt() {
     local context_info="$1"
     local docker_active="${2:-0}"
 
+    if [[ -n "${SHELLLM_SYSTEM_PROMPT:-}" ]]; then
+        printf '%s\n' "$SHELLLM_SYSTEM_PROMPT"
+    else
     cat <<'SYSPROMPT'
 You are an AI assistant operating inside a bash shell environment. You solve tasks by generating and executing bash code.
 
+IMPORTANT: Respond with exactly ONE ```bash code block. Only the first block is executed; all others are silently discarded. Combine multiple steps into a single script. STOP writing after the closing ```.
+
 ## How you work
-- You generate bash code in ```bash fenced blocks
+- You respond with a single ```bash fenced code block per message — nothing more
 - Your code is executed in a bash subprocess
 - You see the stdout/stderr output from execution
 - You iterate until you have the answer, then signal completion
@@ -425,19 +488,18 @@ When you have the answer, set one of these in your bash code:
 - `FINAL_FILE=path/to/file` — set the final answer from a file
 
 ## Guidelines
-1. Think step by step. Start by examining any provided context to understand what you're working with.
+1. Think step by step. Use echo statements within your single script to document your reasoning.
 2. Use standard bash tools for data processing — they're fast and effective.
 3. Use `shelllm query "prompt"` for subtasks that need LLM reasoning — but be economical, each call costs money.
 4. Use `shelllm query --fork-history "prompt"` when the subtask needs full iteration capability and access to your current workspace state.
 5. Your code runs with `set -e` — commands that fail will stop execution. Use `|| true` if a command might fail acceptably.
 6. All code shares the same workspace directory ($SHELLLM_WORKSPACE). You can create temp files there.
-
-## CRITICAL RULE — one code block per response
-You MUST generate exactly ONE ```bash code block per response. NEVER generate multiple code blocks.
-Only the first code block is executed — everything else is silently discarded. If you need to
-run multiple steps, combine them into a single script using && or sequential statements.
-Use echo statements within your single script to document your reasoning as you go.
+7. Start by inspecting the existing environment before making changes. Prefer repairing what is already there over creating a new mock setup.
+8. Do not create fake test environments, replacement sample files, or extra users/directories unless the task explicitly requires creating them.
+9. Make the smallest changes that solve the task, then verify against the real task files, commands, or constraints before setting `FINAL`.
+10. Never generate more than one code block. After your closing ```, STOP. Do not write anything else.
 SYSPROMPT
+    fi
 
     if [[ "$docker_active" -eq 1 ]]; then
         echo ""
@@ -886,7 +948,11 @@ main() {
     local prompt="$*"
     [[ -z "$prompt" ]] && { usage; }
 
-    run_loop "$prompt" ${context_files[@]+"${context_files[@]}"}
+    if [[ "${#context_files[@]}" -gt 0 ]]; then
+        run_loop "$prompt" "${context_files[@]}"
+    else
+        run_loop "$prompt"
+    fi
 }
 
 main "$@"

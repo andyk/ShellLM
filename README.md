@@ -223,30 +223,33 @@ SHELLLM_MAX_ITERATIONS=10
 
 ## Examples
 
+### Compelling use cases
+
+- "What are the five most important AI launches from the last 7 days?" Let shell<sup>LM</sup> search the web, compare sources, dedupe overlapping coverage, and produce a ranked brief with links and one-sentence significance for each item.
+- "Find the cheapest flight patterns for a long weekend in Japan this fall." Let it crawl airline and travel sites, compare date windows, and return a table of likely best departure/return combinations with caveats.
+- "Research the best open-source observability stacks for a 20-person startup." Let it gather docs, GitHub signals, blog posts, and pricing pages, then produce a recommendation memo with tradeoffs.
+- "Map the competitive landscape for AI coding agents." Let it find vendors, pricing, core capabilities, and recent launches, then write a comparison matrix with notable gaps.
+- "Track a developing story across multiple sources." Let it follow reporting from major outlets, reconstruct a timeline, and highlight where accounts agree or diverge.
+- "Split up a research task into sub-agents." Let one branch collect raw facts, another branch normalize them into a table, and a third draft the final summary via `shelllm query --fork-history`.
+
 ```bash
-# Research and summarize
-./shelllm research the latest SpaceX launches and summarize in a table
+# Weekly research brief
+./shelllm research the five most important ai launches from the last 7 days and summarize them in a markdown table with sources
 
-# Process data
-cat sales.csv | ./shelllm find the top 10 customers by revenue
+# Travel planning from live web data
+./shelllm find the cheapest 3-night tokyo trips from san francisco in october and show the best date patterns and booking sources
 
-# Generate code
-./shelllm write a python script that converts markdown to html
+# Vendor landscape research
+./shelllm compare the top open-source observability stacks for a 20-person saas startup and recommend one
 
-# Multi-file analysis
-./shelllm -f src/main.py -f tests/test_main.py find bugs in this code
+# Competitor mapping
+./shelllm map the market for ai coding agents including pricing, key features, and the most notable launches this quarter
 
-# Use a faster/cheaper model
-./shelllm --model claude-sonnet-4-5-20250929 what is 2+2
+# Multi-source news synthesis
+./shelllm reconstruct a timeline of the latest major nvidia announcements from primary sources and reputable coverage
 
-# Limit iterations for quick tasks
-./shelllm --max-iterations 3 what time is it in tokyo
-
-# Preserve workspace for debugging
-./shelllm --workspace /tmp/debug -v why does this segfault
-
-# Skip Docker for speed
-./shelllm --no-docker --max-iterations 1 say hello
+# Recursive delegation for a bigger research task
+./shelllm --workspace /tmp/ai-agents-report research the ai coding agent market, use fork-history to split the work into data gathering and synthesis, and write the final report to report.md
 ```
 
 ## How the LLM sees it
@@ -288,4 +291,3 @@ Single file. No dependencies beyond bash, jq, and curl. ~820 lines.
 ## Acknowledgements
 
 shell<sup>LM</sup> is a port of [Recursive Language Models (RLM)](https://alexzhang13.github.io/blog/2025/rlm/) by Alex Zhang to bash, for bash.
-
