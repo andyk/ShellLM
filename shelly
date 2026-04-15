@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shelly — Interactive conversational agent
+# A thin CLI wrapper around shelllm, mem, and skills that provides
+# multi-turn conversation with session management.
+
+# ---------------------------------------------------------------------------
+# Config & defaults
+# ---------------------------------------------------------------------------
+
+SHELLY_DIR="${SHELLY_DIR:-.shelly}"
+SHELLY_MODEL="${SHELLY_MODEL:-${SHELLLM_MODEL:-claude-opus-4-6}}"
+SHELLY_MEMORIES_DIR="${MEM_DIR:-./.memories}"
+SHELLY_SKILLS_DIR="${SHELLY_SKILLS_DIR:-./.skills}"
+SHELLY_SYSTEM_PROMPT=""
+VERBOSE=0
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() { echo "shelly: error: $*" >&2; exit 1; }
+
+debug() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf '[shelly debug] %s\n' "$*" >&2
+    fi
+}
+
+timestamp_id() {
+    local ts rand
+    ts=$(date +%Y-%m-%d-%H-%M-%S)
+    rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '%s_%s' "$ts" "$rand"
+}
+
+iso_timestamp() {
+    date +%Y-%m-%dT%H:%M:%S
+}
+
+json_escape() {
+    printf '%s' "$1" | jq -Rsa .
+}
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+ensure_session() {
+    mkdir -p "$SHELLY_DIR/sessions" "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR"
+    if [[ ! -L "$SHELLY_DIR/current" ]] || [[ ! -d "$SHELLY_DIR/current" ]]; then
+        cmd_new
+    fi
+}
+
+resolve_session() {
+    if [[ ! -L "$SHELLY_DIR/current" ]]; then
+        die "No active session. Run: shelly new"
+    fi
+    # readlink without -f for macOS compat
+    local target
+    target=$(readlink "$SHELLY_DIR/current")
+    # Handle relative symlinks
+    if [[ "$target" != /* ]]; then
+        target="$SHELLY_DIR/$target"
+    fi
+    if [[ ! -d "$target" ]]; then
+        die "Current session directory missing: $target"
+    fi
+    # Return absolute path (needed for Docker workspace mounts)
+    (cd "$target" && pwd)
+}
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
+assemble_context() {
+    local session_dir="$1"
+    local context=""
+
+    # 1. Personality
+    if [[ -n "$SHELLY_SYSTEM_PROMPT" ]]; then
+        context="$SHELLY_SYSTEM_PROMPT"
+    elif [[ -f "$SHELLY_DIR/system_prompt.txt" ]]; then
+        context=$(cat "$SHELLY_DIR/system_prompt.txt")
+    else
+        context='You are shelly, a conversational AI assistant with persistent memory and skills.
+Be concise and helpful. When answering conversational questions, set FINAL="your answer".
+When tasks require running commands, write the commands and set FINAL with the result.
+
+## Memory system
+You have a persistent memory via the `mem` CLI. Use it to remember things across sessions.
+
+Commands:
+  mem add <text>              Save a new memory (or pipe via stdin)
+  mem add --type TYPE <text>  Save with a type (todo, objective, value, belief, fact, preference, note)
+  mem search <query>          Semantic search across memories
+  mem list                    List all memories (dates + slugs)
+  mem dump                    Print all memory summaries
+  mem forget <name>           Delete a memory by name or prefix
+  mem edit <name> <text>      Update a memory (or pipe new text via stdin)
+
+Memories are stored as markdown files in .memories/ with YAML frontmatter.
+When the user asks you to remember something, use `mem add`. When they ask what you know, check your memories below or use `mem search`.
+
+## Skills system
+You have a skills system via the `skills` CLI. Skills are reusable instruction sets that follow the SKILL.md format.
+
+Commands:
+  skills                              List all installed skills
+  skills <query>                      Search installed + remote skills (GitHub)
+  skills --show <name>                Print a skill'"'"'s full SKILL.md
+  skills --install <owner/repo|path>  Install a skill from GitHub or local path
+  skills --remove <name>              Remove an installed skill
+  skills --init [name]                Scaffold a new skill
+  skills --list-json                  List skills as JSON
+
+Skills live in .skills/ (project-level) and ~/.skills/ (global). Each skill is a directory with a SKILL.md file containing YAML frontmatter (name, description) and markdown instructions.
+When the user asks you to use a skill, read it with `skills --show <name>` and follow its instructions.'
+    fi
+
+    # 2. Memories
+    local memories=""
+    if command -v mem >/dev/null 2>&1; then
+        memories=$(MEM_DIR="$SHELLY_MEMORIES_DIR" mem dump 2>/dev/null) || true
+    fi
+    if [[ -n "$memories" && "$memories" != "No memories stored." ]]; then
+        context="$context
+
+## Memories
+$memories"
+    fi
+
+    # 3. Skills
+    local skills_list=""
+    if [[ -d "$SHELLY_SKILLS_DIR" ]]; then
+        local skill_files
+        skill_files=$(ls -1 "$SHELLY_SKILLS_DIR"/*.md 2>/dev/null) || true
+        if [[ -n "$skill_files" ]]; then
+            local sf
+            for sf in $skill_files; do
+                local skill_name
+                skill_name=$(basename "$sf" .md)
+                local summary
+                summary=$(head -1 "$sf" | sed 's/^#[[:space:]]*//')
+                skills_list="${skills_list}- ${skill_name}: ${summary}
+"
+            done
+        fi
+    fi
+    if [[ -n "$skills_list" ]]; then
+        context="$context
+
+## Available skills
+$skills_list"
+    fi
+
+    # Write assembled context
+    printf '%s' "$context" > "$session_dir/context.txt"
+    printf '%s' "$context"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_send() {
+    local message="$*"
+
+    # Read from stdin if no args and stdin is piped
+    if [[ -z "$message" && ! -t 0 ]]; then
+        message=$(cat)
+    fi
+    [[ -z "$message" ]] && die "No message provided. Usage: shelly send <message>"
+
+    ensure_session
+    local session_dir
+    session_dir=$(resolve_session)
+
+    local ts
+    ts=$(iso_timestamp)
+
+    # Append user message to history
+    local user_json
+    user_json=$(jq -nc --arg role "user" --arg content "$message" --arg ts "$ts" \
+        '{role:$role, content:$content, ts:$ts}')
+    printf '%s\n' "$user_json" >> "$session_dir/history.jsonl"
+
+    # Assemble context (personality, memories, skills)
+    local context
+    context=$(assemble_context "$session_dir")
+
+    # Prepend context to user message so shelllm keeps its own system prompt
+    local full_message="<context>
+$context
+</context>
+
+$message"
+
+    # Build shelllm command
+    local run_dir="$session_dir/run"
+    local response
+
+    if [[ -f "$run_dir/.messages.json" ]]; then
+        # Subsequent call — resume with --continue
+        debug "Resuming session with --continue"
+        response=$(SHELLLM_MODEL="$SHELLY_MODEL" \
+            shelllm --quiet --continue --workspace "$run_dir" "$full_message") || true
+    else
+        # First call — create workspace
+        debug "Starting new shelllm workspace"
+        response=$(SHELLLM_MODEL="$SHELLY_MODEL" \
+            shelllm --quiet --workspace "$run_dir" "$full_message") || true
+    fi
+
+    # Print response
+    if [[ -n "$response" ]]; then
+        printf '%s\n' "$response"
+    fi
+
+    # Append assistant message to history
+    local reply_ts
+    reply_ts=$(iso_timestamp)
+    local abs_run_dir
+    abs_run_dir=$(cd "$run_dir" 2>/dev/null && pwd) || abs_run_dir="$run_dir"
+    local assistant_json
+    assistant_json=$(jq -nc --arg role "assistant" --arg content "${response:-}" \
+        --arg ts "$reply_ts" --arg shelllm_dir "$abs_run_dir" \
+        '{role:$role, content:$content, ts:$ts, shelllm_dir:$shelllm_dir}')
+    printf '%s\n' "$assistant_json" >> "$session_dir/history.jsonl"
+}
+
+cmd_repl() {
+    ensure_session
+
+    printf 'shelly repl (type /help for commands, /quit to exit)\n' >&2
+
+    # Use shelly_history for readline
+    local history_file="$SHELLY_DIR/shelly_history"
+    touch "$history_file"
+
+    # Load readline history
+    if [[ -f "$history_file" ]]; then
+        history -r "$history_file" 2>/dev/null || true
+    fi
+
+    while true; do
+        local input=""
+        # SIGINT during read should not exit the repl
+        if ! IFS= read -e -r -p "> " input; then
+            # EOF (Ctrl-D)
+            printf '\n' >&2
+            break
+        fi
+
+        # Save to readline history
+        history -s "$input" 2>/dev/null || true
+        history -w "$history_file" 2>/dev/null || true
+
+        # Skip empty input
+        [[ -z "$input" ]] && continue
+
+        # Handle slash commands
+        case "$input" in
+            /quit|/exit|/q)
+                break
+                ;;
+            /new)
+                cmd_new
+                printf 'Switched to new session.\n' >&2
+                ;;
+            /sessions)
+                cmd_sessions
+                ;;
+            /switch\ *)
+                local switch_id="${input#/switch }"
+                cmd_switch "$switch_id"
+                ;;
+            /history)
+                cmd_history
+                ;;
+            /reset)
+                cmd_reset
+                printf 'Session reset.\n' >&2
+                ;;
+            /compact)
+                cmd_compact
+                ;;
+            /context)
+                cmd_context
+                ;;
+            /mem\ *)
+                local mem_args="${input#/mem }"
+                eval MEM_DIR=\"\$SHELLY_MEMORIES_DIR\" mem $mem_args
+                ;;
+            /mem)
+                MEM_DIR="$SHELLY_MEMORIES_DIR" mem dump
+                ;;
+            /skills\ *)
+                local skills_args="${input#/skills }"
+                eval SKILLS_DIR=\"\$SHELLY_SKILLS_DIR\" skills $skills_args
+                ;;
+            /skills)
+                SKILLS_DIR="$SHELLY_SKILLS_DIR" skills
+                ;;
+            /help)
+                repl_help
+                ;;
+            /*)
+                printf 'Unknown command: %s (type /help)\n' "$input" >&2
+                ;;
+            *)
+                cmd_send "$input"
+                ;;
+        esac
+    done
+}
+
+repl_help() {
+    cat >&2 <<'EOF'
+Slash commands:
+  /new          Start a new session
+  /sessions     List all sessions
+  /switch <id>  Switch to a session (prefix match)
+  /history      Show conversation history
+  /reset        Reset current session
+  /compact      Summarize and compact history
+  /context      Show assembled system prompt
+  /mem add <text>       Add a memory
+  /mem search <query>   Search memories
+  /mem list             List memories (dates + slugs)
+  /mem dump             Print all memory summaries
+  /mem forget <name>    Delete a memory
+  /mem edit <name> <text> Update a memory
+  /skills               List installed skills
+  /skills <query>       Search installed + remote skills
+  /skills --show <name> Print a skill's SKILL.md
+  /skills --install <src> Install a skill
+  /skills --remove <name> Remove a skill
+  /skills --init [name] Scaffold a new skill
+  /quit         Exit the repl
+EOF
+}
+
+cmd_new() {
+    local ts_id
+    ts_id=$(timestamp_id)
+    local session_dir="$SHELLY_DIR/sessions/$ts_id"
+    mkdir -p "$session_dir"
+
+    # Create meta.txt
+    local cwd
+    cwd=$(pwd)
+    printf 'cwd=%s\nstarted=%s\n' "$cwd" "$(iso_timestamp)" > "$session_dir/meta.txt"
+
+    # Initialize empty history
+    : > "$session_dir/history.jsonl"
+
+    # Symlink memories and skills if they exist
+    local abs_memories
+    abs_memories=$(cd "$SHELLY_MEMORIES_DIR" 2>/dev/null && pwd) || true
+    if [[ -n "$abs_memories" && -d "$abs_memories" ]]; then
+        ln -sfn "$abs_memories" "$session_dir/memories"
+    fi
+
+    local abs_skills
+    abs_skills=$(cd "$SHELLY_SKILLS_DIR" 2>/dev/null && pwd) || true
+    if [[ -n "$abs_skills" && -d "$abs_skills" ]]; then
+        ln -sfn "$abs_skills" "$session_dir/skills"
+    fi
+
+    # Update current symlink
+    ln -sfn "sessions/$ts_id" "$SHELLY_DIR/current"
+
+    debug "Created session: $session_dir"
+    printf '%s\n' "$ts_id" >&2
+}
+
+cmd_sessions() {
+    local sessions_dir="$SHELLY_DIR/sessions"
+    if [[ ! -d "$sessions_dir" ]]; then
+        echo "No sessions." >&2
+        return
+    fi
+
+    local dirs
+    dirs=$(ls -1r "$sessions_dir" 2>/dev/null) || true
+    if [[ -z "$dirs" ]]; then
+        echo "No sessions." >&2
+        return
+    fi
+
+    # Find current session for marking
+    local current_id=""
+    if [[ -L "$SHELLY_DIR/current" ]]; then
+        local cur_target
+        cur_target=$(readlink "$SHELLY_DIR/current")
+        current_id=$(basename "$cur_target")
+    fi
+
+    local d
+    while IFS= read -r d; do
+        local marker=" "
+        [[ "$d" == "$current_id" ]] && marker="*"
+
+        # Get first user message as preview
+        local preview=""
+        local hist="$sessions_dir/$d/history.jsonl"
+        if [[ -f "$hist" ]]; then
+            preview=$(head -1 "$hist" 2>/dev/null | jq -r '.content // ""' 2>/dev/null | head -c 60) || true
+        fi
+
+        # Convert ID timestamp to readable format
+        local display_ts
+        display_ts=$(printf '%s' "$d" | tr 'T' ' ' | tr '-' ':' | sed 's/^\([0-9]*\):\([0-9]*\):\([0-9]*\)/\1-\2-\3/')
+        printf '%s %s  %s\n' "$marker" "$d" "$preview"
+    done <<< "$dirs"
+}
+
+cmd_switch() {
+    local target="$1"
+    [[ -z "$target" ]] && die "Usage: shelly switch <session-id>"
+
+    local sessions_dir="$SHELLY_DIR/sessions"
+    [[ ! -d "$sessions_dir" ]] && die "No sessions found"
+
+    # Try exact match first
+    if [[ -d "$sessions_dir/$target" ]]; then
+        ln -sfn "sessions/$target" "$SHELLY_DIR/current"
+        printf 'Switched to: %s\n' "$target" >&2
+        return
+    fi
+
+    # Prefix/substring match
+    local matches
+    matches=$(ls -1 "$sessions_dir" 2>/dev/null | grep "$target" || true)
+    local count
+    count=$(printf '%s' "$matches" | grep -c . 2>/dev/null) || count=0
+
+    if [[ "$count" -eq 1 ]]; then
+        ln -sfn "sessions/$matches" "$SHELLY_DIR/current"
+        printf 'Switched to: %s\n' "$matches" >&2
+    elif [[ "$count" -gt 1 ]]; then
+        die "Ambiguous: '$target' matches multiple sessions:
+$matches"
+    else
+        die "No session matching: $target"
+    fi
+}
+
+cmd_history() {
+    ensure_session
+    local session_dir
+    session_dir=$(resolve_session)
+
+    local hist="$session_dir/history.jsonl"
+    if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
+        echo "(empty history)" >&2
+        return
+    fi
+
+    while IFS= read -r line; do
+        local role content
+        role=$(printf '%s' "$line" | jq -r '.role // ""')
+        content=$(printf '%s' "$line" | jq -r '.content // ""')
+
+        if [[ "$role" == "user" ]]; then
+            printf '> %s\n\n' "$content"
+        elif [[ "$role" == "assistant" ]]; then
+            printf '%s\n\n' "$content"
+        fi
+    done < "$hist"
+}
+
+cmd_reset() {
+    ensure_session
+    local session_dir
+    session_dir=$(resolve_session)
+
+    # Truncate history
+    : > "$session_dir/history.jsonl"
+
+    # Remove shelllm workspace
+    rm -rf "$session_dir/run"
+
+    debug "Cleared session: $session_dir"
+}
+
+cmd_compact() {
+    ensure_session
+    local session_dir
+    session_dir=$(resolve_session)
+
+    local hist="$session_dir/history.jsonl"
+    if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
+        echo "Nothing to compact." >&2
+        return
+    fi
+
+    # Build conversation text from history
+    local conversation=""
+    while IFS= read -r line; do
+        local role content
+        role=$(printf '%s' "$line" | jq -r '.role // ""')
+        content=$(printf '%s' "$line" | jq -r '.content // ""')
+        if [[ "$role" == "user" ]]; then
+            conversation="${conversation}User: ${content}
+"
+        elif [[ "$role" == "assistant" ]]; then
+            conversation="${conversation}Assistant: ${content}
+"
+        fi
+    done < "$hist"
+
+    # Summarize using shelllm
+    printf 'Compacting session...\n' >&2
+    local summary
+    summary=$(printf '%s' "$conversation" | shelllm --quiet \
+        "Summarize this conversation concisely. Capture key facts, decisions, and context. Output a brief summary paragraph.") || {
+        die "Failed to compact session"
+    }
+
+    # Replace history with summary
+    local ts
+    ts=$(iso_timestamp)
+    printf '' > "$hist"
+    local sys_json
+    sys_json=$(jq -nc --arg role "assistant" --arg content "[Compacted] $summary" --arg ts "$ts" \
+        '{role:$role, content:$content, ts:$ts}')
+    printf '%s\n' "$sys_json" > "$hist"
+
+    # Remove old shelllm workspace (will be recreated on next send)
+    rm -rf "$session_dir/run"
+
+    printf 'Session compacted.\n' >&2
+}
+
+cmd_context() {
+    ensure_session
+    local session_dir
+    session_dir=$(resolve_session)
+    assemble_context "$session_dir" >/dev/null
+    cat "$session_dir/context.txt"
+    printf '\n'
+}
+
+cmd_help() {
+    cat <<'EOF'
+shelly — Interactive conversational agent
+
+Usage:
+  shelly send <message>        Send a message (or pipe via stdin)
+  shelly repl                  Start interactive REPL
+  shelly new                   Create a new session
+  shelly sessions              List all sessions
+  shelly switch <id>           Switch to a session (prefix match)
+  shelly history               Show conversation history
+  shelly reset                 Reset current session
+  shelly compact               Summarize and compact history
+  shelly context               Show assembled system prompt
+
+Memory:
+  shelly mem add <text>        Add a memory (or pipe via stdin)
+  shelly mem search <query>    Search memories (semantic via shelllm)
+  shelly mem list              List memories (dates + slugs)
+  shelly mem dump              Print all memory summaries
+  shelly mem forget <name>     Delete a memory by name/prefix
+  shelly mem edit <name> <text> Update a memory's body
+
+Skills:
+  shelly skills                List installed skills
+  shelly skills <query>        Search installed + remote skills
+  shelly skills --show <name>  Print a skill's SKILL.md
+  shelly skills --install <src> Install a skill (owner/repo, URL, or path)
+  shelly skills --remove <name> Remove an installed skill
+  shelly skills --init [name]  Scaffold a new skill
+
+Options:
+  --system-prompt FILE    Override system prompt with file contents
+  --model MODEL           Model to use (default: claude-opus-4-6)
+  --dir DIR               Override .shelly directory
+  -v, --verbose           Verbose/debug mode
+  -h, --help              Show this help
+
+Environment:
+  SHELLY_DIR              Override .shelly directory
+  SHELLY_MODEL            Model to use
+  SHELLY_MEMORIES_DIR     Memories directory (default: ./.memories)
+  SHELLY_SKILLS_DIR       Skills directory (default: ./.skills)
+EOF
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing & dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+    # Parse global flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cmd_help
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --model)
+                SHELLY_MODEL="${2:?--model requires a value}"
+                shift 2
+                ;;
+            --system-prompt)
+                local sp_file="${2:?--system-prompt requires a file path}"
+                [[ -f "$sp_file" ]] || die "System prompt file not found: $sp_file"
+                SHELLY_SYSTEM_PROMPT=$(cat "$sp_file")
+                shift 2
+                ;;
+            --dir)
+                SHELLY_DIR="${2:?--dir requires a path}"
+                shift 2
+                ;;
+            -*)
+                die "Unknown option: $1 (try shelly --help)"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    ensure_session
+
+    local cmd="${1:-}"
+    [[ -n "$cmd" ]] && shift
+
+    case "$cmd" in
+        send)
+            cmd_send "$@"
+            ;;
+        repl)
+            cmd_repl
+            ;;
+        new)
+            cmd_new
+            ;;
+        sessions|ls)
+            cmd_sessions
+            ;;
+        switch)
+            [[ $# -eq 0 ]] && die "Usage: shelly switch <session-id>"
+            cmd_switch "$1"
+            ;;
+        history)
+            cmd_history
+            ;;
+        reset)
+            cmd_reset
+            ;;
+        compact)
+            cmd_compact
+            ;;
+        context)
+            cmd_context
+            ;;
+        mem)
+            MEM_DIR="$SHELLY_MEMORIES_DIR" mem "$@"
+            ;;
+        skills)
+            SKILLS_DIR="$SHELLY_SKILLS_DIR" skills "$@"
+            ;;
+        help)
+            cmd_help
+            ;;
+        "")
+            # Default to repl
+            cmd_repl
+            ;;
+        *)
+            # Treat unknown command as a message to send
+            cmd_send "$cmd $*"
+            ;;
+    esac
+}
+
+main "$@"
