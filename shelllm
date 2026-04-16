@@ -19,6 +19,7 @@ SHELLLM_DOCKER_IMAGE="${SHELLLM_DOCKER_IMAGE:-ubuntu:latest}"
 SHELLLM_NO_DOCKER="${SHELLLM_NO_DOCKER:-0}"
 SHELLLM_DEPTH="${SHELLLM_DEPTH:-0}"
 SHELLLM_MAX_DEPTH="${SHELLLM_MAX_DEPTH:-3}"
+SHELLLM_INACTIVITY_TIMEOUT="${SHELLLM_INACTIVITY_TIMEOUT:-30}"
 VERBOSE=0
 QUIET=0
 
@@ -127,6 +128,7 @@ Environment:
   SHELLLM_SYSTEM_PROMPT    Override the default system prompt text
   SHELLLM_DOCKER_IMAGE     Docker image to use
   SHELLLM_NO_DOCKER        Set to 1 to disable Docker
+  SHELLLM_INACTIVITY_TIMEOUT  Seconds before killing idle execution (default: 30)
   SHELLLM_WORKSPACE        (Internal) Workspace directory for current session
 
 Context is passed to generated code as environment variables:
@@ -169,7 +171,77 @@ redact_sensitive() {
         output="${output//${ANTHROPIC_API_KEY}/<redacted-anthropic-key>}"
     fi
 
-    printf '%s' "$output" | sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
+    printf '%s' "$output" | LC_ALL=C sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
+}
+
+# ---------------------------------------------------------------------------
+# Interactive prompt detection
+# ---------------------------------------------------------------------------
+
+detect_interactive_prompt() {
+    local tail_bytes="$1"
+    # Normalize: lowercase, collapse whitespace
+    local normalized
+    normalized=$(printf '%s' "$tail_bytes" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')
+
+    case "$normalized" in
+        *password:*|*passphrase:*)
+            echo "password_prompt" ;;
+        *"[y/n]"*|*"[yes/no]"*|*"are you sure"*|*"continue?"*|*"proceed?"*)
+            echo "confirmation_prompt" ;;
+        *username:*|*"login:"*)
+            echo "login_prompt" ;;
+        *"enter "*|*"type "*|*"provide "*|*"input "*|*"specify "*)
+            echo "input_prompt" ;;
+        *"press "*"to continue"*|*"press "*"to "*|*"hit "*"to continue"*)
+            echo "keypress_prompt" ;;
+        *)
+            # Check for generic prompt: short trailing text ending with ": " or "? "
+            # Extract last line (may not have newline)
+            local last_line
+            last_line=$(printf '%s' "$tail_bytes" | tr '\r' '\n' | grep -v '^$' | tail -1 || true)
+            if [[ -n "$last_line" && ${#last_line} -lt 120 ]]; then
+                case "$last_line" in
+                    *": "|*":"|*"? ")
+                        echo "generic_prompt" ; return ;;
+                esac
+            fi
+            echo "unknown"
+            ;;
+    esac
+}
+
+build_inactivity_feedback() {
+    local output="$1"
+    local prompt_type="$2"
+    local timeout="$3"
+
+    local last_output
+    last_output=$(truncate_output "$output")
+
+    local advice=""
+    case "$prompt_type" in
+        password_prompt)
+            advice="DETECTED: Password/passphrase prompt. Use token-based auth, SSH keys, or credential files instead of interactive passwords." ;;
+        confirmation_prompt)
+            advice="DETECTED: Confirmation prompt. Retry with --yes, -y, --force, --assume-yes, --non-interactive, or equivalent flag." ;;
+        login_prompt)
+            advice="DETECTED: Login/username prompt. Use environment variables, config files, or --user flags instead of interactive login." ;;
+        input_prompt)
+            advice="DETECTED: Input prompt. Provide the value via command-line arguments, environment variables, or pipe (echo 'value' | command)." ;;
+        keypress_prompt)
+            advice="DETECTED: Keypress prompt. Use --batch, --non-interactive, or pipe input to bypass." ;;
+        generic_prompt)
+            advice="DETECTED: Likely interactive prompt (line ending with ':' or '?'). Use non-interactive flags or pipe input." ;;
+        unknown)
+            advice="Could not detect a specific prompt pattern. The process may be waiting for stdin, a network response, or is simply slow. Try non-interactive flags or investigate the command's batch mode." ;;
+    esac
+
+    printf 'Execution was KILLED after %s seconds of inactivity\n' "$timeout"
+    printf '(likely waiting for interactive input that will never arrive).\n'
+    printf 'stdin is connected to /dev/null — interactive prompts get immediate EOF.\n'
+    printf '\nLast output before timeout:\n%s\n' "$last_output"
+    printf '\n%s\n' "$advice"
 }
 
 # ---------------------------------------------------------------------------
@@ -248,7 +320,7 @@ docker_setup() {
     docker exec --user 0:0 "$_SHELLLM_CONTAINER" \
         bash -c '
         apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq jq curl python3 >/dev/null 2>&1
+        apt-get install -y -qq jq curl python3 tmux >/dev/null 2>&1
         ' >/dev/null 2>&1 || {
         progress "Warning: could not install tools in container"
     }
@@ -295,9 +367,9 @@ execute_code() {
             "${docker_env_flags[@]}" \
             -w "$workspace" \
             "$_SHELLLM_CONTAINER" \
-            bash -e -c "$wrapped_code" 2>&1
+            bash -e -c "$wrapped_code" </dev/null 2>&1
     else
-        cd "$workspace" && env "${env_vars[@]}" bash -e -c "$wrapped_code" 2>&1
+        cd "$workspace" && env "${env_vars[@]}" bash -e -c "$wrapped_code" </dev/null 2>&1
     fi
 }
 
@@ -544,6 +616,25 @@ When you have the answer, set one of these in your bash code:
 8. Do not print environment variables wholesale. Avoid `env`, `printenv`, or `set` unless the user explicitly asks for them.
 9. Use `shelllm --fork "prompt"` only when you need a nested run that inherits the current session history and workspace state.
 10. Never generate more than one code block. After your closing ```, STOP. Do not write anything else.
+11. Your code runs with stdin connected to /dev/null. Interactive prompts
+    (password, confirmation, etc.) will get immediate EOF and fail. Always
+    use non-interactive flags: --yes, -y, --force, --batch, etc.
+    If true interaction still seems necessary, you may create your own
+    PTY-backed session using tmux and interact with it explicitly.
+    Use this workflow:
+      a. Start a named tmux session running the target command.
+      b. Inspect the visible terminal state using tmux capture or screenshots.
+      c. Reason about what prompt is being shown.
+      d. Send bounded input with tmux send-keys.
+      e. Re-inspect the terminal after each step.
+      f. Exit or terminate the session when done.
+    When using tmux:
+      - Prefer unique session names.
+      - Capture pane contents frequently to understand the current state.
+      - Send small, deliberate inputs — usually one line or one keypress at a time.
+      - Do not assume a prompt was accepted until you inspect the terminal again.
+      - If the interaction becomes unclear or cyclic, stop and reassess.
+      - tmux may need to be installed first (apt-get install -y tmux).
 SYSPROMPT
     fi
 
@@ -756,7 +847,22 @@ run_loop() {
 
     # --- Cleanup trap ---
     _cleanup_docker="$docker_active"
+    _cleanup_workspace="$workspace"
     cleanup() {
+        # Kill lingering exec/watchdog processes
+        local pid_file
+        for pid_file in "$_cleanup_workspace/.exec_pid" "$_cleanup_workspace/.watchdog_pid"; do
+            if [[ -f "$pid_file" ]]; then
+                local pid
+                pid=$(cat "$pid_file" 2>/dev/null || true)
+                if [[ -n "$pid" ]]; then
+                    kill "$pid" 2>/dev/null || true
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+                rm -f "$pid_file"
+            fi
+        done
+        rm -f "$_cleanup_workspace/.timeout" "$_cleanup_workspace/.output"
         if [[ "${_cleanup_docker:-0}" -eq 1 ]]; then
             docker_teardown
         fi
@@ -843,38 +949,121 @@ exit \$__shelllm_rc
             env_vars+=("FILE_CONTEXT$((j + 1))=${file_contexts[$j]}")
         done
 
-        # Execute code — stream output live to stderr
+        # Execute code — background exec + watchdog + polling reader
         local output_file="$workspace/.output"
+        local exec_pid_file="$workspace/.exec_pid"
+        local watchdog_pid_file="$workspace/.watchdog_pid"
+        local timeout_marker="$workspace/.timeout"
         : > "$output_file"
+        rm -f "$timeout_marker" "$exec_pid_file" "$watchdog_pid_file"
         local exit_code=0
+        local timed_out=0
 
+        # Background: run execute_code, capture PID
         set +eo pipefail
-        execute_code "$workspace" "$wrapped_code" "${env_vars[@]}" 2>&1 | \
-            while IFS= read -r line; do
+        set +m  # suppress "Terminated" job-control messages
+        execute_code "$workspace" "$wrapped_code" "${env_vars[@]}" >> "$output_file" 2>&1 &
+        local exec_pid=$!
+        printf '%s' "$exec_pid" > "$exec_pid_file"
+        set -eo pipefail
+
+        # Background: watchdog monitors output file size for inactivity
+        (
+            local last_size=0
+            local stale_seconds=0
+            while kill -0 "$exec_pid" 2>/dev/null; do
+                sleep 1
+                local cur_size
+                cur_size=$(wc -c < "$output_file" 2>/dev/null || echo 0)
+                cur_size=$(echo "$cur_size" | tr -d ' ')
+                if [[ "$cur_size" -eq "$last_size" ]]; then
+                    stale_seconds=$((stale_seconds + 1))
+                else
+                    stale_seconds=0
+                    last_size="$cur_size"
+                fi
+                if [[ "$stale_seconds" -ge "$SHELLLM_INACTIVITY_TIMEOUT" ]]; then
+                    touch "$timeout_marker"
+                    kill "$exec_pid" 2>/dev/null || true
+                    # Give it a moment, then force-kill if needed
+                    sleep 2
+                    kill -9 "$exec_pid" 2>/dev/null || true
+                    break
+                fi
+            done
+        ) &
+        local watchdog_pid=$!
+        printf '%s' "$watchdog_pid" > "$watchdog_pid_file"
+
+        # Foreground: poll output file and stream new lines to stderr
+        local lines_read=0
+        while kill -0 "$exec_pid" 2>/dev/null; do
+            # Read any new lines from the output file
+            local total_lines
+            total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
+            total_lines=$(echo "$total_lines" | tr -d ' ')
+            if [[ "$total_lines" -gt "$lines_read" ]]; then
+                local new_count=$((total_lines - lines_read))
+                local skip_n=$((lines_read + 1))
+                # Use tail + head to get new lines (bash 3.2 safe)
+                tail -n +"$skip_n" "$output_file" | head -n "$new_count" | while IFS= read -r line; do
+                    local redacted_line
+                    redacted_line=$(redact_sensitive "$line")
+                    if [[ "$QUIET" -eq 0 ]]; then
+                        if [[ "$redacted_line" == +* ]]; then
+                            printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
+                        else
+                            printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
+                        fi
+                    fi
+                done
+                lines_read="$total_lines"
+            fi
+            sleep 0.2
+        done
+
+        # Collect exit code from exec process
+        wait "$exec_pid" 2>/dev/null && exit_code=0 || exit_code=$?
+
+        # Kill watchdog now that exec is done
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+
+        # Drain any remaining output lines
+        local total_lines
+        total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
+        total_lines=$(echo "$total_lines" | tr -d ' ')
+        if [[ "$total_lines" -gt "$lines_read" ]]; then
+            local new_count=$((total_lines - lines_read))
+            local skip_n=$((lines_read + 1))
+            tail -n +"$skip_n" "$output_file" | head -n "$new_count" | while IFS= read -r line; do
                 local redacted_line
                 redacted_line=$(redact_sensitive "$line")
-                printf '%s\n' "$redacted_line" >> "$output_file"
                 if [[ "$QUIET" -eq 0 ]]; then
                     if [[ "$redacted_line" == +* ]]; then
-                        # xtrace: show the command being run (cyan)
                         printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
                     else
-                        # regular output (dim)
                         printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
                     fi
                 fi
             done
-        exit_code=${PIPESTATUS[0]}
-        set -eo pipefail
+        fi
+
+        # Check if we timed out
+        if [[ -f "$timeout_marker" ]]; then
+            timed_out=1
+        fi
 
         local output
         output=$(cat "$output_file")
-        rm -f "$output_file"
+        rm -f "$output_file" "$exec_pid_file" "$watchdog_pid_file" "$timeout_marker"
 
-        debug "Exit code: $exit_code"
+        debug "Exit code: $exit_code, timed_out: $timed_out"
 
         # Show exit status
-        if [[ "$exit_code" -eq 0 ]]; then
+        if [[ "$timed_out" -eq 1 ]]; then
+            progress "\033[1;31mKILLED — inactivity timeout (${SHELLLM_INACTIVITY_TIMEOUT}s)\033[0m"
+        elif [[ "$exit_code" -eq 0 ]]; then
             progress_dim "Exit 0"
         else
             progress "\033[1;31mExit $exit_code\033[0m"
@@ -888,21 +1077,32 @@ exit \$__shelllm_rc
             return 0
         fi
 
-        # Build execution result message (strip xtrace lines for LLM)
-        local clean_output
-        clean_output=$(printf '%s' "$output" | grep -v '^+\+ ' | grep -v '^+ ' || true)
+        # Build execution result message
         local result_text
-        local truncated_output
-        truncated_output=$(truncate_output "$clean_output")
-
-        if [[ "$exit_code" -eq 0 ]]; then
-            result_text="Execution output (exit code 0):\n$truncated_output"
+        if [[ "$timed_out" -eq 1 ]]; then
+            # Detect what kind of prompt was waiting
+            local tail_bytes
+            tail_bytes=$(printf '%s' "$output" | tail -c 500)
+            local prompt_type
+            prompt_type=$(detect_interactive_prompt "$tail_bytes")
+            debug "Detected prompt type: $prompt_type"
+            result_text=$(build_inactivity_feedback "$output" "$prompt_type" "$SHELLLM_INACTIVITY_TIMEOUT")
         else
-            result_text="Execution FAILED (exit code $exit_code):\n$truncated_output"
-        fi
+            # Normal result — strip xtrace lines for LLM
+            local clean_output
+            clean_output=$(printf '%s' "$output" | grep -v '^+\+ ' | grep -v '^+ ' || true)
+            local truncated_output
+            truncated_output=$(truncate_output "$clean_output")
 
-        if [[ -z "$truncated_output" ]]; then
-            result_text="Execution completed (exit code $exit_code) with no output."
+            if [[ "$exit_code" -eq 0 ]]; then
+                result_text="Execution output (exit code 0):\n$truncated_output"
+            else
+                result_text="Execution FAILED (exit code $exit_code):\n$truncated_output"
+            fi
+
+            if [[ -z "$truncated_output" ]]; then
+                result_text="Execution completed (exit code $exit_code) with no output."
+            fi
         fi
 
         # Append assistant response and execution result to history

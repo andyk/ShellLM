@@ -214,21 +214,39 @@ $context
 
 $message"
 
-    # Build shelllm command
+    # Run shelllm in background so Ctrl+C can interrupt it
     local run_dir="$session_dir/run"
-    local response
+    local response_file
+    response_file=$(mktemp)
+    local _interrupted=0
 
     if [[ -f "$run_dir/.messages.json" ]]; then
-        # Subsequent call — resume with --continue
         debug "Resuming session with --continue"
-        response=$(SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
-            shelllm --continue --workspace "$run_dir" "$full_message") || true
+        SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
+            shelllm --continue --workspace "$run_dir" "$full_message" > "$response_file" &
     else
-        # First call — create workspace
         debug "Starting new shelllm workspace"
-        response=$(SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
-            shelllm --workspace "$run_dir" "$full_message") || true
+        SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
+            shelllm --workspace "$run_dir" "$full_message" > "$response_file" &
     fi
+    local shelllm_pid=$!
+
+    # Trap SIGINT: kill shelllm but don't exit shelly
+    trap '_interrupted=1; kill $shelllm_pid 2>/dev/null || true' INT
+    wait "$shelllm_pid" 2>/dev/null && true || true
+    trap - INT
+
+    if [[ "$_interrupted" -eq 1 ]]; then
+        # Wait for shelllm to fully exit (cleanup trap, Docker teardown, etc.)
+        wait "$shelllm_pid" 2>/dev/null || true
+        rm -f "$response_file"
+        printf '\n(interrupted)\n' >&2
+        return 0
+    fi
+
+    local response
+    response=$(cat "$response_file")
+    rm -f "$response_file"
 
     # Print response
     if [[ -n "$response" ]]; then
@@ -250,7 +268,7 @@ $message"
 cmd_repl() {
     ensure_session
 
-    printf 'shelly repl (type /help for commands, /quit to exit)\n' >&2
+    printf 'shelly repl (Ctrl+C to interrupt, Ctrl+D to exit)\n' >&2
 
     # Use shelly_history for readline
     local history_file="$SHELLY_DIR/shelly_history"
@@ -263,8 +281,20 @@ cmd_repl() {
 
     while true; do
         local input=""
-        # SIGINT during read should not exit the repl
-        if ! IFS= read -e -r -p "> " input; then
+        local _sigint=0
+
+        # Trap SIGINT at the prompt: clear line, re-prompt
+        trap '_sigint=1' INT
+        local read_rc=0
+        IFS= read -e -r -p "> " input || read_rc=$?
+        trap - INT
+
+        if [[ "$_sigint" -eq 1 ]]; then
+            printf '\n' >&2
+            continue
+        fi
+
+        if [[ "$read_rc" -ne 0 ]]; then
             # EOF (Ctrl-D)
             printf '\n' >&2
             break
