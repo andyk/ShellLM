@@ -9,7 +9,7 @@ ___        |  ___|| | | ||  ___|| | | |  |  \  /  |
 /__ /      |_____||_| |_||_____||_____|
 ```
 
-This repos contains shell tools for building AIs, centered around a recursive LLM CLI (shell<sup>LM</sup>). `shelllm` thinks by writing shell commands, running them, and iterating until it has an answer. `shelly` wraps `shelllm` with `mem`ory and `skills`.
+A bash-native AI agent that thinks by writing shell commands, running them, and iterating until it has an answer. Composed of dead simple shell tools.
 
 ## Why the shell?
 
