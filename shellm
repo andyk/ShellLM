@@ -362,10 +362,18 @@ docker_setup() {
 
     # Install essential tools as root and grant passwordless sudo.
     progress_dim "Installing tools in container..."
-    docker exec --user 0:0 "$_SHELLM_CONTAINER" \
+    docker exec --user 0:0 -e SHELLM_UID="$(id -u)" -e SHELLM_GID="$(id -g)" \
+        "$_SHELLM_CONTAINER" \
         bash -c '
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y -qq jq curl python3 tmux sudo >/dev/null 2>&1
+        # Create user for the mapped UID/GID so sudo works
+        if ! getent group "$SHELLM_GID" >/dev/null 2>&1; then
+            groupadd -g "$SHELLM_GID" shellm 2>/dev/null || true
+        fi
+        if ! getent passwd "$SHELLM_UID" >/dev/null 2>&1; then
+            useradd -u "$SHELLM_UID" -g "$SHELLM_GID" -d /tmp -s /bin/bash -M shellm 2>/dev/null || true
+        fi
         # Grant passwordless sudo to the container user
         echo "ALL ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/shellm
         chmod 0440 /etc/sudoers.d/shellm
