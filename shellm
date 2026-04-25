@@ -1658,6 +1658,8 @@ exit \$__shellm_rc
             final_answer=$(cat "$rundir/.shellm/final")
             emit_event "final" "$final_answer"
             redact_sensitive "$final_answer"
+            [[ "$QUIET" -eq 0 ]] && echo >&2
+            progress_dim "Run: $rundir"
             return 0
         fi
 
