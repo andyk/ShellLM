@@ -179,8 +179,9 @@ action_list() {
             [[ -z "$name" ]] && name=$(basename "$skill_dir")
             [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
 
-            printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n" \
-                "$name" "${_dim}${desc}" "$label"
+            local skill_path="${skill_dir%/}"
+            printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
+                "$name" "${_dim}${desc}" "$label" "$skill_path"
         done
     done < <(_all_skill_dirs)
 
@@ -638,6 +639,7 @@ main() {
                 shift 2
                 ;;
             # Legacy flag forms (still supported)
+            --list)      action="list";     shift ;;
             --install)   action="install";  shift ;;
             --remove)    action="remove";   shift ;;
             --show)      action="show";     shift ;;
@@ -654,6 +656,21 @@ main() {
                 ;;
         esac
     done
+
+    # Subcommand-style dispatch (e.g. "skills show foo" instead of "skills --show foo")
+    if [[ -z "$action" && $# -gt 0 ]]; then
+        case "$1" in
+            list)      action="list";     shift ;;
+            list-json) action="list-json"; shift ;;
+            install)   action="install";  shift ;;
+            remove)    action="remove";   shift ;;
+            show)      action="show";     shift ;;
+            init)      action="init";     shift ;;
+            promote)   action="promote";  shift ;;
+            demote)    action="demote";   shift ;;
+            kernel)    action="kernel";   shift ;;
+        esac
+    fi
 
     local remaining="$*"
 

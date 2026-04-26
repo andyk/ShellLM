@@ -5,6 +5,22 @@ set -euo pipefail
 # An LLM that operates inside a bash shell, generating and executing code
 # to process context and solve tasks recursively.
 
+# Load .env if present (check cwd, then script's own directory)
+_shellm_load_env() {
+    local envfile="$1"
+    if [[ -f "$envfile" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$envfile"
+        set +a
+        return 0
+    fi
+    return 1
+}
+_SHELLM_SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]:-$0}")
+_SHELLM_SCRIPT_DIR=$(cd "$(dirname "$_SHELLM_SCRIPT_PATH")" && pwd -P)
+_shellm_load_env ".env" || _shellm_load_env "$_SHELLM_SCRIPT_DIR/.env" || true
+
 # ---------------------------------------------------------------------------
 # Config & defaults
 # ---------------------------------------------------------------------------
@@ -34,6 +50,8 @@ _SHELLM_WORKDIR_USER=""
 _SHELLM_DOCKER_BROKER_DIR=""
 _SHELLM_DOCKER_BROKER_TRANSPORT=""
 _SHELLM_TOOL_MOUNTS_VERSION=1
+_SHELLM_EXTRA_VARS=()
+_SHELLM_EXTRA_BINS=()
 
 # Load .env if present
 if [[ -f ".env" ]]; then
@@ -113,6 +131,8 @@ Options:
   --system-prompt FILE Override the default system prompt with contents of FILE
   --docker-image IMAGE Docker image to use (default: ubuntu:latest)
   --docker-access MODE Docker access for generated code: none, broker, socket, dind
+  --var NAME=VALUE       Set env var for generated code (repeatable)
+  --bin PATH             Make binary available on PATH (repeatable)
   --print-system-prompt Print the system prompt and exit
 
 Environment:
@@ -407,6 +427,37 @@ resolve_shellm_tool_path() {
     return 1
 }
 
+docker_prepare_container_tools() {
+    local shellm_path="$1"
+    [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 ]] || return 0
+
+    local tool tool_path
+    for tool in llm; do
+        tool_path=$(resolve_shellm_tool_path "$shellm_path" "$tool" || true)
+        [[ -n "$tool_path" ]] || continue
+        local dest="/usr/local/bin/$tool"
+        if ! docker exec -w / "$_SHELLM_CONTAINER" test -x "$dest" >/dev/null 2>&1; then
+            docker cp "$tool_path" "$_SHELLM_CONTAINER:$dest" >/dev/null 2>&1 || \
+                die "Could not install $tool in shellm container"
+            docker exec --user 0:0 -w / "$_SHELLM_CONTAINER" chmod 0755 "$dest" >/dev/null 2>&1 || \
+                die "Could not make $tool executable in shellm container"
+        fi
+    done
+
+    # Install --bin binaries
+    for _bin_path in "${_SHELLM_EXTRA_BINS[@]+"${_SHELLM_EXTRA_BINS[@]}"}"; do
+        local _bin_name
+        _bin_name=$(basename "$_bin_path")
+        local _dest="/usr/local/bin/$_bin_name"
+        if ! docker exec -w / "$_SHELLM_CONTAINER" test -x "$_dest" >/dev/null 2>&1; then
+            docker cp "$_bin_path" "$_SHELLM_CONTAINER:$_dest" >/dev/null 2>&1 || \
+                die "Could not install $_bin_name in shellm container"
+            docker exec --user 0:0 -w / "$_SHELLM_CONTAINER" chmod 0755 "$_dest" >/dev/null 2>&1 || \
+                die "Could not make $_bin_name executable in shellm container"
+        fi
+    done
+}
+
 docker_broker_start() {
     local env_name="$1"
     local workspace="$2"
@@ -432,6 +483,24 @@ docker_broker_start() {
 
     _SHELLM_DOCKER_BROKER_DIR="$broker_dir"
     progress "Docker broker ready ($_SHELLM_DOCKER_BROKER_TRANSPORT transport)"
+}
+
+docker_broker_prepare_container() {
+    local shellm_path="$1"
+    [[ "$SHELLM_DOCKER_ACCESS" == "broker" ]] || return 0
+    [[ -n "${_SHELLM_CONTAINER:-}" ]] || return 0
+
+    local client_path
+    client_path=$(tool_sibling_path "$shellm_path" "shellm-docker")
+    [[ -x "$client_path" ]] || die "Broker mode requires shellm-docker next to shellm: $client_path"
+
+    docker exec --user 0:0 -w / "$_SHELLM_CONTAINER" sh -c '
+        if [ -x /usr/local/bin/shellm-docker ] && [ ! -e /usr/local/bin/docker ]; then
+            ln -s /usr/local/bin/shellm-docker /usr/local/bin/docker
+        fi
+    ' >/dev/null 2>&1 || die "Could not install docker facade in broker container"
+    docker exec -w / "$_SHELLM_CONTAINER" test -x /usr/local/bin/docker >/dev/null 2>&1 || \
+        die "Broker mode requires an executable docker facade in the container"
 }
 
 docker_broker_stop() {
@@ -602,11 +671,28 @@ docker_setup() {
         extra_mounts+=(-v "$abs_dir:$abs_dir:ro")
     done
 
+    # Mount directories referenced by --var values
+    for _ev in "${_SHELLM_EXTRA_VARS[@]+"${_SHELLM_EXTRA_VARS[@]}"}"; do
+        local _val="${_ev#*=}"
+        [[ -d "$_val" ]] || continue
+        local abs_dir
+        abs_dir=$(cd "$_val" && pwd) || continue
+        local already=0
+        for d in "${seen_dirs[@]+"${seen_dirs[@]}"}"; do
+            [[ "$abs_dir" == "$d"* ]] && { already=1; break; }
+        done
+        [[ "$already" -eq 1 ]] && continue
+        seen_dirs+=("$abs_dir")
+        extra_mounts+=(-v "$abs_dir:$abs_dir")
+    done
+
     case "$SHELLM_DOCKER_ACCESS" in
         broker)
             local client_path
             client_path=$(resolve_shellm_tool_path "$shellm_path" "shellm-docker" || true)
             [[ -x "$client_path" ]] || die "Broker mode requires shellm-docker next to shellm or on PATH"
+            # Also mount as 'docker' facade so tools expecting the docker CLI work
+            docker_run_flags+=(-v "$client_path:/usr/local/bin/docker:ro")
             if [[ "$_SHELLM_DOCKER_BROKER_TRANSPORT" == "socket" ]]; then
                 install_packages+=(socat)
             fi
@@ -640,7 +726,7 @@ docker_setup() {
     # Install essential tools as root and grant passwordless sudo.
     progress_dim "Installing tools in container..."
     local package_list="${install_packages[*]}"
-    if ! docker exec --user 0:0 \
+    if ! docker exec --user 0:0 -w / \
         -e SHELLM_UID="$(id -u)" \
         -e SHELLM_GID="$(id -g)" \
         -e SHELLM_APT_PACKAGES="$package_list" \
@@ -667,7 +753,7 @@ docker_setup() {
     fi
 
     if [[ "$SHELLM_DOCKER_ACCESS" == "socket" ]]; then
-        docker exec -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" \
+        docker exec -w / -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" \
             docker info >/dev/null 2>&1 || docker_setup_die "Container could not access Docker through $SHELLM_DOCKER_SOCKET"
     elif [[ "$SHELLM_DOCKER_ACCESS" == "dind" ]]; then
         progress_dim "Starting inner Docker daemon..."
@@ -675,23 +761,23 @@ docker_setup() {
         # FS is already overlayfs (e.g. Docker Desktop on macOS). vfs is slow
         # but the only driver that works reliably across nesting environments
         # — fuse-overlayfs mounts cleanly here but runc can't exec from them.
-        docker exec --user 0:0 "$_SHELLM_CONTAINER" bash -c '
+        docker exec --user 0:0 -w / "$_SHELLM_CONTAINER" bash -c '
             nohup dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs >/var/log/shellm-dockerd.log 2>&1 &
         ' >/dev/null 2>&1 || docker_setup_die "Could not start inner Docker daemon"
         local i
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-            if docker exec --user 0:0 -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" docker info >/dev/null 2>&1; then
-                docker exec --user 0:0 "$_SHELLM_CONTAINER" chmod 666 /var/run/docker.sock >/dev/null 2>&1 || true
+            if docker exec --user 0:0 -w / -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" docker info >/dev/null 2>&1; then
+                docker exec --user 0:0 -w / "$_SHELLM_CONTAINER" chmod 666 /var/run/docker.sock >/dev/null 2>&1 || true
                 break
             fi
             sleep 1
         done
-        docker exec -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" \
+        docker exec -w / -e DOCKER_HOST=unix:///var/run/docker.sock "$_SHELLM_CONTAINER" \
             docker info >/dev/null 2>&1 || docker_setup_die "Inner Docker daemon did not become ready"
     fi
 
     # Verify bash is available
-    docker exec "$_SHELLM_CONTAINER" bash --version >/dev/null 2>&1 || \
+    docker exec -w / "$_SHELLM_CONTAINER" bash --version >/dev/null 2>&1 || \
         docker_setup_die "Docker image $SHELLM_DOCKER_IMAGE does not have bash"
 
     _SHELLM_DOCKER_MODE=1
@@ -869,7 +955,28 @@ execute_code() {
             "$_SHELLM_CONTAINER" \
             bash -e -c "$wrapped_code" </dev/null 2>&1
     else
-        cd "$workspace" && env "${env_vars[@]}" bash -e -c "$wrapped_code" </dev/null 2>&1
+        local _extra_path=""
+        for _bin_path in "${_SHELLM_EXTRA_BINS[@]+"${_SHELLM_EXTRA_BINS[@]}"}"; do
+            local _bin_dir
+            _bin_dir=$(dirname "$_bin_path")
+            [[ ":$_extra_path:" != *":$_bin_dir:"* ]] && _extra_path="${_extra_path:+$_extra_path:}$_bin_dir"
+        done
+        if [[ -n "$_extra_path" ]]; then
+            local -a _patched_vars=()
+            local _found_path=0
+            for _ev in "${env_vars[@]}"; do
+                if [[ "$_ev" == PATH=* ]]; then
+                    _patched_vars+=("PATH=$_extra_path:${_ev#PATH=}")
+                    _found_path=1
+                else
+                    _patched_vars+=("$_ev")
+                fi
+            done
+            [[ "$_found_path" -eq 0 ]] && _patched_vars+=("PATH=$_extra_path:$PATH")
+            cd "$workspace" && env "${_patched_vars[@]}" bash -e -c "$wrapped_code" </dev/null 2>&1
+        else
+            cd "$workspace" && env "${env_vars[@]}" bash -e -c "$wrapped_code" </dev/null 2>&1
+        fi
     fi
 }
 
@@ -1034,7 +1141,7 @@ SYSPROMPT
 
 
 ## Guidelines
-- Always start by inspecting `$CONTEXT` and `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, if they were provided
+- Always start by inspecting `$CONTEXT` and `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, if they were provided. These variables contain the context text itself, not file paths; use `printf '%s\n' "$FILE_CONTEXT1"` instead of `cat "$FILE_CONTEXT1"`.
 - Think step by step. Document your reasoning.
 - Your code runs with `set -e` — commands that fail will stop execution. Use `|| true` if a command might fail acceptably.
 - All code shares the same working directory ($SHELLM_WORKDIR). You can create/read/edit/delete files there.
@@ -1046,6 +1153,12 @@ SYSPROMPT
     use non-interactive flags: --yes, -y, --force, --batch, etc.
     If true interaction still seems necessary, you may create your own
     PTY-backed session using tmux and interact with it explicitly.
+    For long-running jobs that must continue while you run other commands,
+    prefer a named tmux session or `setsid -f ... </dev/null >log 2>&1`.
+    Do not rely on `nohup ... &` alone for durable benchmark or server runs.
+    If that long-running job uses Docker broker mode, keep the broker alive
+    for the lifetime of the job; a detached Docker job cannot make progress
+    after its broker exits.
     Use this workflow:
       a. Start a named tmux session running the target command.
       b. Inspect the visible terminal state using tmux capture or screenshots.
@@ -1071,7 +1184,7 @@ SYSPROMPT
         if [[ "$SHELLM_DOCKER_ACCESS" == "broker" ]]; then
             echo ""
             echo "## Docker access"
-            echo "Use shellm-docker, not docker. shellm-docker talks to a host-side broker that only allows bounded container operations. The broker manages workspace mounts and rejects privileged containers, arbitrary bind mounts, host namespace sharing, device access, and Docker socket mounts."
+            echo "shellm-docker talks to a host-side broker that only allows bounded container operations. A constrained docker facade is also available for tools such as Harbor: docker info and docker compose build/down/up/exec/cp/stop/config/version are brokered with the same policy. The broker manages workspace mounts and rejects privileged containers, arbitrary bind mounts, host namespace sharing, device access, and Docker socket mounts."
             echo "Broker transport: ${_SHELLM_DOCKER_BROKER_TRANSPORT:-$SHELLM_DOCKER_BROKER_TRANSPORT}."
         elif [[ "$SHELLM_DOCKER_ACCESS" == "socket" ]]; then
             echo ""
@@ -1088,6 +1201,7 @@ SYSPROMPT
     if [[ -n "$context_info" ]]; then
         echo ""
         echo "## Context available as environment variables"
+        echo "The variables below contain text content. The source path is listed only for orientation and may not be mounted in this execution environment."
         echo "$context_info"
     fi
 
@@ -1403,6 +1517,8 @@ run_loop() {
             docker_active=1
             progress "Created env: $ws_name"
         fi
+        docker_prepare_container_tools "$shellm_path"
+        docker_broker_prepare_container "$shellm_path"
         docker_broker_start "$ws_name" "$workdir" "$shellm_path"
     fi
 
@@ -1569,6 +1685,10 @@ exit \$__shellm_rc
             _SHELLM_ROOT_RUNDIR="$_SHELLM_ROOT_RUNDIR"
             PATH="$(dirname "$shellm_path"):$PATH"
         )
+        # Forward --var values
+        for _ev in "${_SHELLM_EXTRA_VARS[@]+"${_SHELLM_EXTRA_VARS[@]}"}"; do
+            env_vars+=("$_ev")
+        done
         if [[ "$SHELLM_DOCKER_ACCESS" == "broker" && -n "${_SHELLM_DOCKER_BROKER_DIR:-}" ]]; then
             env_vars+=(SHELLM_DOCKER_BROKER="$_SHELLM_DOCKER_BROKER_DIR")
             env_vars+=(SHELLM_DOCKER_TRANSPORT="$_SHELLM_DOCKER_BROKER_TRANSPORT")
@@ -1856,6 +1976,16 @@ main() {
                 ;;
             --docker-access)
                 SHELLM_DOCKER_ACCESS="${2:?--docker-access requires a value}"
+                shift 2
+                ;;
+            --var)
+                _SHELLM_EXTRA_VARS+=("${2:?--var requires NAME=VALUE}")
+                shift 2
+                ;;
+            --bin)
+                local bin_path="${2:?--bin requires a file path}"
+                [[ -f "$bin_path" && -x "$bin_path" ]] || die "--bin file not found or not executable: $bin_path"
+                _SHELLM_EXTRA_BINS+=("$(realpath "$bin_path")")
                 shift 2
                 ;;
             -*)

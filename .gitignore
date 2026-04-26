@@ -1,3 +1,5 @@
 *.swp
 .env
 .shelly/
+.memories/
+.skills/

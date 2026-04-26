@@ -208,7 +208,7 @@ Docker detection works like this:
 - If already inside a Docker container (e.g. CI) → runs locally unless `SHELLM_ALLOW_NESTED_DOCKER=1`
 - If Docker isn't installed → runs locally
 
-Docker access from inside the sandbox is off by default. `--docker-access broker` is the recommended mode when the agent needs helper containers: generated code gets `shellm-docker`, which talks to a host-side shellm broker that rejects privileged containers, arbitrary bind mounts, host namespace sharing, device access, and Docker socket mounts. On Linux, the broker uses `socat` for a Unix socket transport when available; otherwise it falls back to a filesystem request/response transport.
+Docker access from inside the sandbox is off by default. `--docker-access broker` is the recommended mode when the agent needs helper containers: generated code gets `shellm-docker`, plus a constrained `docker` facade for tools such as Harbor. The facade supports `docker info` and brokered `docker compose build/down/up/exec/cp/stop/config/version`; the broker rejects privileged containers, arbitrary bind mounts, host namespace sharing, device access, and Docker socket mounts. On Linux, the broker uses `socat` for a Unix socket transport when available; otherwise it falls back to a filesystem request/response transport.
 
 `--docker-access socket` mounts `/var/run/docker.sock` into the sandbox. This is convenient, but it is not a strong sandbox because the agent can control the host Docker daemon. `--docker-access dind` starts an inner Docker daemon in a privileged outer container, which is also not a strong sandbox.
 

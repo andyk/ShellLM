@@ -15,19 +15,75 @@ not a pass-through wrapper for the docker CLI.
 EOF
 }
 
+docker_usage() {
+    cat <<'EOF'
+Usage:
+  docker info
+  docker --version
+  docker version [ARG...]
+  docker compose --version
+  docker compose SUBCOMMAND [ARG...]
+  docker ps
+  docker logs CONTAINER
+  docker rm CONTAINER
+
+This is shellm's constrained Docker facade. It supports the Docker commands
+needed by Harbor and forwards them to the host-side shellm Docker broker.
+EOF
+}
+
 die() { echo "shellm-docker: error: $*" >&2; exit 1; }
+
+make_args_json() {
+    if [[ "$#" -eq 0 ]]; then
+        printf '[]\n'
+    else
+        printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]'
+    fi
+}
+
+make_env_json() {
+    env -0 | jq -Rs '
+        split("\u0000")[:-1]
+        | map(index("=") as $i | select($i != null) | {key: .[0:$i], value: .[$i+1:]})
+        | from_entries
+    '
+}
 
 make_request_json() {
     local op="$1"
-    shift
-    local args_json
-    args_json=$(printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]')
+    local include_env="$2"
+    shift 2
+    local args_json env_json
+    args_json=$(make_args_json "$@")
+    if [[ "$include_env" -eq 1 ]]; then
+        env_json=$(make_env_json)
+    else
+        env_json='{}'
+    fi
     jq -n \
         --arg op "$op" \
         --arg cwd "$PWD" \
         --arg workdir "${SHELLM_WORKDIR:-$PWD}" \
         --argjson args "$args_json" \
-        '{op:$op,args:$args,cwd:$cwd,workdir:$workdir}'
+        --argjson env "$env_json" \
+        '{op:$op,args:$args,cwd:$cwd,workdir:$workdir,env:$env}'
+}
+
+send_request() {
+    local op="$1"
+    local include_env="$2"
+    shift 2
+    local request response transport
+    request=$(make_request_json "$op" "$include_env" "$@")
+    transport="${SHELLM_DOCKER_TRANSPORT:-${SHELLM_DOCKER_BROKER_TRANSPORT:-filesystem}}"
+    case "$transport" in
+        socket) response=$(send_socket "$request") ;;
+        filesystem) response=$(send_filesystem "$request") ;;
+        *) die "unsupported broker transport: $transport" ;;
+    esac
+
+    print_response "$response"
 }
 
 send_socket() {
@@ -59,7 +115,9 @@ send_filesystem() {
     printf '%s' "$request" > "$tmp"
     mv "$tmp" "$req"
 
-    local timeout="${SHELLM_DOCKER_REQUEST_TIMEOUT:-300}"
+    # Harbor tasks can legitimately run for several hours; let Harbor's own
+    # per-task timeout be the primary bound instead of cutting Docker off first.
+    local timeout="${SHELLM_DOCKER_REQUEST_TIMEOUT:-14400}"
     local waited=0
     while [[ ! -f "$res" ]]; do
         if [[ "$waited" -ge "$timeout" ]]; then
@@ -101,16 +159,41 @@ main() {
         *) die "unsupported operation: $op" ;;
     esac
 
-    local request response transport
-    request=$(make_request_json "$op" "$@")
-    transport="${SHELLM_DOCKER_TRANSPORT:-${SHELLM_DOCKER_BROKER_TRANSPORT:-filesystem}}"
-    case "$transport" in
-        socket) response=$(send_socket "$request") ;;
-        filesystem) response=$(send_filesystem "$request") ;;
-        *) die "unsupported broker transport: $transport" ;;
-    esac
-
-    print_response "$response"
+    send_request "$op" 0 "$@"
 }
 
-main "$@"
+docker_main() {
+    [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { docker_usage; exit 0; }
+    [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]] && { send_request version 0 "$@"; exit 0; }
+    [[ $# -ge 1 ]] || { docker_usage >&2; exit 1; }
+    [[ "${SHELLM_DOCKER_ACCESS:-}" == "broker" ]] || die "docker facade is only available when SHELLM_DOCKER_ACCESS=broker"
+
+    local op="$1"
+    shift
+    case "$op" in
+        info)
+            send_request info 0 "$@"
+            ;;
+        version)
+            send_request version 0 "$@"
+            ;;
+        compose)
+            [[ "$#" -ge 1 ]] || die "docker compose requires a subcommand"
+            case "${1:-}" in
+                -v|--version) send_request compose 0 version ;;
+                *) send_request compose 1 "$@" ;;
+            esac
+            ;;
+        ps|logs|rm)
+            send_request "$op" 0 "$@"
+            ;;
+        *)
+            die "unsupported docker facade operation: $op"
+            ;;
+    esac
+}
+
+case "$(basename "$0")" in
+    docker) docker_main "$@" ;;
+    *) main "$@" ;;
+esac
