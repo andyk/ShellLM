@@ -1,0 +1,17 @@
+{{ instruction }}
+
+---
+
+INSTRUCTIONS FROM THE EVALUATOR (in addition to the task above):
+
+1. Think as hard as you can about every step before acting.
+2. Use shellm recursion aggressively — when a sub-problem is non-trivial, spawn
+   a nested shellm with rich, summarised context so it can make focused progress.
+3. Do NOT give up. If a first attempt fails, analyse the failure carefully,
+   form a new hypothesis, and try again. Keep iterating until the task is
+   genuinely complete.
+4. The verifier will run automated tests against the task's success criteria
+   when you finish. Make sure all required side effects on the filesystem and
+   any required outputs are in place before signalling completion.
+5. If you signal completion early without the work actually being done, the
+   trial fails. So always double-check by re-running tests, listing files, etc.
