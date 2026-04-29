@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# view — Read files with line numbers, range selection, binary detection
+#
+# Usage:
+#   view FILE [START[:END]]
+#   view FILE --offset N [--limit M]
+#   view FILE                         # entire file
+#   view FILE 10                      # from line 10 to EOF
+#   view FILE 10:20                   # lines 10 through 20
+#   view FILE --offset 10 --limit 5   # 5 lines starting at line 10
+
+usage() {
+    sed -nE '3,12s/^# ?//p' "$0"
+    exit "${1:-0}"
+}
+
+die() { echo "view: $*" >&2; exit 1; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────
+
+file=""
+offset=""
+limit=""
+pos_range=""
+flag_mode=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage 0 ;;
+        --offset)     [[ -n "${2:-}" ]] || die "--offset requires a value"
+                      offset="$2"; flag_mode=1; shift 2 ;;
+        --limit)      [[ -n "${2:-}" ]] || die "--limit requires a value"
+                      limit="$2"; flag_mode=1; shift 2 ;;
+        -*)           die "unknown option: $1" ;;
+        *)
+            if [[ -z "$file" ]]; then
+                file="$1"
+            elif [[ -z "$pos_range" ]]; then
+                pos_range="$1"
+            else
+                die "unexpected argument: $1"
+            fi
+            shift ;;
+    esac
+done
+
+[[ -n "$file" ]] || { usage 1; }
+
+# Disallow mixing positional range with flags
+if [[ -n "$pos_range" && $flag_mode -eq 1 ]]; then
+    die "cannot mix positional range (START[:END]) with --offset/--limit"
+fi
+
+# ── Resolve range ────────────────────────────────────────────────────────
+
+start_line=1
+end_line=""  # empty = EOF
+
+if [[ -n "$pos_range" ]]; then
+    if [[ "$pos_range" == *:* ]]; then
+        start_line="${pos_range%%:*}"
+        end_line="${pos_range#*:}"
+    else
+        start_line="$pos_range"
+    fi
+fi
+
+if [[ -n "$offset" ]]; then
+    start_line="$offset"
+fi
+# limit is handled after we know start_line
+if [[ -n "$limit" ]]; then
+    end_line=$(( start_line + limit - 1 ))
+fi
+
+# Validate numeric
+[[ "$start_line" =~ ^[0-9]+$ ]] || die "start line must be a number: $start_line"
+[[ -z "$end_line" || "$end_line" =~ ^[0-9]+$ ]] || die "end line must be a number: $end_line"
+
+if [[ -n "$end_line" && "$end_line" -lt "$start_line" ]]; then
+    die "end line ($end_line) is before start line ($start_line)"
+fi
+
+# ── Validate file ────────────────────────────────────────────────────────
+
+[[ -e "$file" ]] || die "no such file: $file"
+[[ -f "$file" ]] || die "not a regular file: $file"
+[[ -r "$file" ]] || die "permission denied: $file"
+
+# ── Binary detection (NUL byte check, same as git) ───────────────────────
+
+nul_count=$(head -c 8192 "$file" | LC_ALL=C tr -cd '\0' | wc -c | tr -d ' ')
+if [[ "$nul_count" -gt 0 ]]; then
+    die "binary file: $file"
+fi
+
+# ── Output with line numbers ─────────────────────────────────────────────
+
+if [[ -n "$end_line" ]]; then
+    awk -v s="$start_line" -v e="$end_line" \
+        'NR >= s && NR <= e { printf "%6d\t%s\n", NR, $0 } NR > e { exit }' "$file"
+else
+    awk -v s="$start_line" \
+        'NR >= s { printf "%6d\t%s\n", NR, $0 }' "$file"
+fi

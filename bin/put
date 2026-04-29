@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# put — Write stdin to a file atomically
+#
+# Usage:
+#   echo "content" | put FILE
+#   cat data.json  | put FILE --force      # overwrite existing
+#   echo "hello"   | put path/to/FILE --parents  # create dirs
+#
+# Reads stdin, writes to FILE atomically (via temp file + mv).
+# Refuses to overwrite existing files unless --force is given.
+
+usage() {
+    sed -nE '3,13s/^# ?//p' "$0"
+    exit "${1:-0}"
+}
+
+die() { echo "put: $*" >&2; exit 1; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────
+
+file=""
+force=0
+parents=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage 0 ;;
+        --force|-f)   force=1; shift ;;
+        --parents|-p) parents=1; shift ;;
+        -*)           die "unknown option: $1" ;;
+        *)
+            [[ -z "$file" ]] || die "unexpected argument: $1"
+            file="$1"; shift ;;
+    esac
+done
+
+[[ -n "$file" ]] || die "no target file specified"
+
+# ── Validate / create parent dirs ────────────────────────────────────────
+
+dir="$(dirname "$file")"
+
+if [[ ! -d "$dir" ]]; then
+    if [[ $parents -eq 1 ]]; then
+        mkdir -p "$dir"
+    else
+        die "directory does not exist: $dir (use --parents to create)"
+    fi
+fi
+
+if [[ -e "$file" && $force -eq 0 ]]; then
+    die "file already exists: $file (use --force to overwrite)"
+fi
+
+# ── Atomic write ─────────────────────────────────────────────────────────
+
+tmp="$(mktemp "$dir/put.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+cat > "$tmp"
+
+# Preserve permissions if overwriting
+if [[ -f "$file" ]]; then
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+fi
+
+mv -f "$tmp" "$file"
+trap - EXIT
+
+bytes=$(wc -c < "$file" | tr -d ' ')
+echo "put: wrote $file ($bytes bytes)" >&2

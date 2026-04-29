@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sub — Exact-string substitution in files
+#
+# Usage:
+#   sub FILE OLD NEW                  # inline strings
+#   sub FILE --old-file F1 --new-file F2  # read from files
+#   sub FILE OLD NEW --replace-all    # replace all occurrences
+#
+# Finds OLD exactly (literal, not regex) in FILE and replaces it with NEW.
+# Fails if OLD appears zero or more than one time (unless --replace-all).
+# Writes atomically via temp file + mv.
+
+usage() {
+    sed -nE '3,14s/^# ?//p' "$0"
+    exit "${1:-0}"
+}
+
+die() { echo "sub: $*" >&2; exit 1; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────
+
+file=""
+old_str=""
+new_str=""
+old_file=""
+new_file=""
+replace_all=0
+positionals=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)       usage 0 ;;
+        --replace-all)   replace_all=1; shift ;;
+        --old-file)      [[ -n "${2:-}" ]] || die "--old-file requires a value"
+                         old_file="$2"; shift 2 ;;
+        --new-file)      [[ -n "${2:-}" ]] || die "--new-file requires a value"
+                         new_file="$2"; shift 2 ;;
+        -*)              die "unknown option: $1" ;;
+        *)               positionals+=("$1"); shift ;;
+    esac
+done
+
+# Resolve positional args
+case ${#positionals[@]} in
+    1)  file="${positionals[0]}" ;;
+    3)  file="${positionals[0]}"; old_str="${positionals[1]}"; new_str="${positionals[2]}" ;;
+    *)  die "expected: FILE OLD NEW  or  FILE --old-file F --new-file F" ;;
+esac
+
+# Read OLD/NEW from files if specified
+if [[ -n "$old_file" ]]; then
+    [[ -f "$old_file" ]] || die "old-file not found: $old_file"
+    old_str="$(cat "$old_file")"
+fi
+if [[ -n "$new_file" ]]; then
+    [[ -f "$new_file" ]] || die "new-file not found: $new_file"
+    new_str="$(cat "$new_file")"
+fi
+
+[[ -n "$old_str" ]] || die "OLD string is empty"
+[[ "$old_str" != "$new_str" ]] || die "OLD and NEW are identical"
+
+# ── Validate file ────────────────────────────────────────────────────────
+
+[[ -e "$file" ]] || die "no such file: $file"
+[[ -f "$file" ]] || die "not a regular file: $file"
+[[ -r "$file" ]] || die "permission denied: $file"
+
+# ── Count occurrences (literal, not regex) ───────────────────────────────
+
+content="$(cat "$file")"
+
+# Use awk to count non-overlapping occurrences of a literal string.
+# We pass old_str via environment to avoid awk argument escaping issues.
+count=$(SUB_OLD="$old_str" awk 'BEGIN {
+    old = ENVIRON["SUB_OLD"]
+    len_old = length(old)
+    if (len_old == 0) { print 0; exit }
+}
+{
+    lines[NR] = $0
+}
+END {
+    # Reconstruct file content with newlines
+    content = ""
+    for (i = 1; i <= NR; i++) {
+        if (i > 1) content = content "\n"
+        content = content lines[i]
+    }
+    n = 0
+    pos = 1
+    while ((idx = index(substr(content, pos), old)) > 0) {
+        n++
+        pos = pos + idx + len_old - 1
+    }
+    print n
+}' "$file")
+
+if [[ "$count" -eq 0 ]]; then
+    die "OLD string not found in $file"
+elif [[ "$count" -gt 1 && $replace_all -eq 0 ]]; then
+    die "OLD string found $count times in $file (use --replace-all to replace all)"
+fi
+
+# ── Perform substitution ────────────────────────────────────────────────
+
+# Use awk for literal (non-regex) find-and-replace.
+dir="$(dirname "$file")"
+tmp="$(mktemp "$dir/sub.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+if [[ $replace_all -eq 1 ]]; then
+    max_replacements=0  # unlimited
+else
+    max_replacements=1
+fi
+
+SUB_OLD="$old_str" SUB_NEW="$new_str" SUB_MAX="$max_replacements" awk 'BEGIN {
+    old = ENVIRON["SUB_OLD"]
+    new = ENVIRON["SUB_NEW"]
+    max = int(ENVIRON["SUB_MAX"])
+    len_old = length(old)
+}
+{
+    lines[NR] = $0
+}
+END {
+    # Reconstruct file content
+    content = ""
+    for (i = 1; i <= NR; i++) {
+        if (i > 1) content = content "\n"
+        content = content lines[i]
+    }
+
+    result = ""
+    n = 0
+    pos = 1
+    total_len = length(content)
+
+    while (pos <= total_len) {
+        idx = index(substr(content, pos), old)
+        if (idx == 0 || (max > 0 && n >= max)) {
+            result = result substr(content, pos)
+            break
+        }
+        result = result substr(content, pos, idx - 1) new
+        pos = pos + idx - 1 + len_old
+        n++
+    }
+
+    # Preserve trailing newline if original file had one
+    printf "%s", result
+}' "$file" > "$tmp"
+
+# Preserve trailing newline: if original ended with newline, ensure replacement does too
+if [[ -s "$file" ]] && [[ "$(tail -c 1 "$file" | wc -l)" -gt 0 ]]; then
+    # Original file ends with a newline
+    if [[ -s "$tmp" ]] && [[ "$(tail -c 1 "$tmp" | wc -l)" -eq 0 ]]; then
+        echo "" >> "$tmp"
+    fi
+fi
+
+# Preserve permissions
+chmod --reference="$file" "$tmp" 2>/dev/null || true
+
+mv -f "$tmp" "$file"
+trap - EXIT
+
+echo "sub: replaced $count occurrence(s) in $file" >&2

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# glob — Git-aware glob pattern matching, sorted by mtime (newest first)
+#
+# Usage:
+#   glob PATTERN [DIR]
+#   glob '**/*.sh'              # all .sh files under cwd
+#   glob '*.py' src/            # .py files under src/
+#   glob '**/*.test.ts' --limit 10  # first 10 results
+#
+# In a git repo: uses git ls-files (tracked + untracked, respects .gitignore).
+# Outside git: uses find with common exclusions (.git, node_modules, .venv).
+# Results are sorted by modification time, newest first.
+
+usage() {
+    sed -nE '3,14s/^# ?//p' "$0"
+    exit "${1:-0}"
+}
+
+die() { echo "glob: $*" >&2; exit 1; }
+
+# ── Detect platform stat command for mtime ───────────────────────────────
+
+if stat -f "%m" /dev/null >/dev/null 2>&1; then
+    # macOS / BSD
+    get_mtime() { stat -f "%m" "$1"; }
+else
+    # GNU / Linux
+    get_mtime() { stat -c "%Y" "$1"; }
+fi
+
+# ── Parse arguments ──────────────────────────────────────────────────────
+
+pattern=""
+dir=""
+limit=0
+positionals=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage 0 ;;
+        --limit)      [[ -n "${2:-}" ]] || die "--limit requires a value"
+                      limit="$2"; shift 2 ;;
+        -*)           die "unknown option: $1" ;;
+        *)            positionals+=("$1"); shift ;;
+    esac
+done
+
+case ${#positionals[@]} in
+    0)  die "no pattern specified" ;;
+    1)  pattern="${positionals[0]}"; dir="." ;;
+    2)  pattern="${positionals[0]}"; dir="${positionals[1]}" ;;
+    *)  die "too many arguments" ;;
+esac
+
+[[ -d "$dir" ]] || die "not a directory: $dir"
+
+# ── Convert glob pattern to grep regex for filtering ─────────────────────
+
+# Convert a glob pattern to an ERE pattern for filtering file paths.
+glob_to_regex() {
+    local glob="$1"
+    local regex=""
+    local i=0
+    local len=${#glob}
+    while [[ $i -lt $len ]]; do
+        local c="${glob:$i:1}"
+        case "$c" in
+            '*')
+                if [[ $((i+1)) -lt $len && "${glob:$((i+1)):1}" == '*' ]]; then
+                    # ** — match anything including /
+                    if [[ $((i+2)) -lt $len && "${glob:$((i+2)):1}" == '/' ]]; then
+                        regex+="(.+/)?"
+                        i=$((i+3))
+                    else
+                        regex+=".*"
+                        i=$((i+2))
+                    fi
+                else
+                    # * — match anything except /
+                    regex+="[^/]*"
+                    i=$((i+1))
+                fi
+                ;;
+            '?')  regex+="."; i=$((i+1)) ;;
+            '.')  regex+="\\."; i=$((i+1)) ;;
+            '\\') regex+="\\\\"; i=$((i+1)) ;;
+            '+'|'^'|'$'|'{'|'}'|'('|')'|'|')
+                  regex+="\\$c"; i=$((i+1)) ;;
+            '[')  # pass through character classes
+                  local j=$((i+1))
+                  local bracket="["
+                  while [[ $j -lt $len && "${glob:$j:1}" != ']' ]]; do
+                      bracket+="${glob:$j:1}"
+                      j=$((j+1))
+                  done
+                  if [[ $j -lt $len ]]; then
+                      bracket+="]"
+                      regex+="$bracket"
+                      i=$((j+1))
+                  else
+                      regex+="\\["
+                      i=$((i+1))
+                  fi
+                  ;;
+            *)    regex+="$c"; i=$((i+1)) ;;
+        esac
+    done
+    echo "^${regex}$"
+}
+
+filter_regex="$(glob_to_regex "$pattern")"
+
+# ── Collect file list ────────────────────────────────────────────────────
+
+collect_files() {
+    local search_dir="$1"
+    local git_root
+    git_root="$(cd "$search_dir" && git rev-parse --show-toplevel 2>/dev/null)" || true
+
+    if [[ -n "$git_root" ]]; then
+        # Git repo: list tracked + untracked files, respecting .gitignore
+        (cd "$search_dir" && git ls-files --cached --others --exclude-standard) 2>/dev/null
+    else
+        # Non-git: use find, excluding common dirs
+        (cd "$search_dir" && find . \
+            -name .git -prune -o \
+            -name node_modules -prune -o \
+            -name .venv -prune -o \
+            -name __pycache__ -prune -o \
+            -name .DS_Store -prune -o \
+            -type f -print \
+        ) | sed 's|^\./||'
+    fi
+}
+
+# ── Filter, stat for mtime, sort, output ─────────────────────────────────
+
+# Build mtime<TAB>filename lines, sort descending, apply limit.
+# No associative arrays needed — works on bash 3+.
+
+count=0
+while IFS=$'\t' read -r _mtime f; do
+    [[ -n "$f" ]] || continue
+    echo "$f"
+    count=$((count + 1))
+    if [[ $limit -gt 0 && $count -ge $limit ]]; then
+        break
+    fi
+done < <(
+    collect_files "$dir" | grep -E "$filter_regex" | while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        full="$dir/$f"
+        [[ -f "$full" ]] || continue
+        mt="$(get_mtime "$full" 2>/dev/null)" || continue
+        printf '%s\t%s\n' "$mt" "$f"
+    done | sort -t$'\t' -k1,1 -rn
+)
