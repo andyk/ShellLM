@@ -20,7 +20,7 @@ _llm_load_env() {
     fi
     return 1
 }
-_llm_load_env ".env" || _llm_load_env "$(dirname "$(realpath "$0")")/.env" || true
+_llm_load_env ".env" || _llm_load_env "$HOME/.shellm/.env" || true
 
 LLM_MODEL=""
 LLM_SYSTEM=""

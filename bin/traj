@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# traj — Trajectory storage substrate for shellm.
+# Reads and writes step records to <run_dir>/.shellm/trajectory.jsonl.
+# No filtering policy; that lives in `context`.
+
+# ---------------------------------------------------------------------------
+# Defaults & constants
+# ---------------------------------------------------------------------------
+
+STDOUT_INLINE_LIMIT="${SHELLM_STDOUT_INLINE_LIMIT:-4096}"
+TRAJ_FILE="trajectory.jsonl"
+BLOB_DIR="trajectory_blobs"
+
+die() { printf 'traj: error: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'EOF'
+Usage: traj <command> [args]
+
+Commands:
+  append <run_dir>          Read a step JSON from stdin, assign step id, spill
+                            large stdout/stderr to blobs, append to trajectory.
+  show <run_dir> <step>     Pretty-print a single step.
+        [--full]            Inline blobs even if they exceed limits.
+        [--field F]         Emit just that field's bytes (stdout|stderr|cmd|thought).
+  tail <run_dir> [-n N] [-f]
+                            Like tail but for trajectory.jsonl.
+  search <run_dir> <pattern>
+        [--field F]         Search field (stdout|stderr|cmd|thought|all). Default: all.
+        [-i]                Case-insensitive.
+        [-C N]              Context lines.
+        [-E]                Extended regex (default: literal substring).
+
+EOF
+    exit "${1:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Generate a 6-char lowercase hex step id.
+gen_step_id() {
+    head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+# Determine the next blob_id for a step by counting existing blobs.
+next_blob_id() {
+    local blob_dir="$1" step_id="$2"
+    local count=0
+    if [[ -d "$blob_dir" ]]; then
+        count=$(find "$blob_dir" -maxdepth 1 -name "${step_id}-*" \( -name '*.stdout' -o -name '*.stderr' \) 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    printf '%06x' "$count"
+}
+
+# Byte length of a string (LC_ALL=C to count bytes, not chars).
+byte_len() {
+    printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
+}
+
+# ---------------------------------------------------------------------------
+# append
+# ---------------------------------------------------------------------------
+
+cmd_append() {
+    local run_dir="${1:?append requires <run_dir>}"
+    local shellm_dir="$run_dir/.shellm"
+    local traj_file="$shellm_dir/$TRAJ_FILE"
+    local blob_dir="$shellm_dir/$BLOB_DIR"
+
+    # Read the step record from stdin.
+    local record
+    record=$(cat)
+    [[ -n "$record" ]] || die "append: empty stdin"
+
+    # Validate it's JSON.
+    printf '%s' "$record" | jq empty 2>/dev/null || die "append: invalid JSON on stdin"
+
+    # Assign step id.
+    local step_id
+    step_id=$(gen_step_id)
+
+    # Add step_id and ts (if not already present).
+    record=$(printf '%s' "$record" | jq --arg id "$step_id" '. + {step_id: $id} | if .ts == null then . + {ts: (now | floor)} else . end')
+
+    # Process stdout: spill if over limit.
+    local stdout_val
+    stdout_val=$(printf '%s' "$record" | jq -r '.stdout // empty')
+    local stdout_bytes
+    stdout_bytes=$(byte_len "$stdout_val")
+
+    if [[ "$stdout_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stdout_val" ]]; then
+        mkdir -p "$blob_dir"
+        local blob_id
+        blob_id=$(next_blob_id "$blob_dir" "$step_id")
+        local blob_file="$blob_dir/${step_id}-${blob_id}.stdout"
+        local blob_ref="$BLOB_DIR/${step_id}-${blob_id}.stdout"
+
+        # Write blob first (atomic: write to temp then rename).
+        local tmp_blob
+        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
+        printf '%s' "$stdout_val" > "$tmp_blob"
+        sync "$tmp_blob" 2>/dev/null || true
+        mv "$tmp_blob" "$blob_file"
+
+        # Truncate inline to first INLINE_LIMIT bytes.
+        local inline_val
+        inline_val=$(printf '%s' "$stdout_val" | head -c "$STDOUT_INLINE_LIMIT")
+
+        record=$(printf '%s' "$record" | jq \
+            --arg stdout "$inline_val" \
+            --arg ref "$blob_ref" \
+            --argjson bytes "$stdout_bytes" \
+            '. + {stdout: $stdout, stdout_ref: $ref, stdout_bytes: $bytes, stdout_truncated: true}')
+    fi
+
+    # Process stderr: spill if over limit.
+    local stderr_val
+    stderr_val=$(printf '%s' "$record" | jq -r '.stderr // empty')
+    local stderr_bytes
+    stderr_bytes=$(byte_len "$stderr_val")
+
+    if [[ "$stderr_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stderr_val" ]]; then
+        mkdir -p "$blob_dir"
+        local blob_id
+        blob_id=$(next_blob_id "$blob_dir" "$step_id")
+        local blob_file="$blob_dir/${step_id}-${blob_id}.stderr"
+        local blob_ref="$BLOB_DIR/${step_id}-${blob_id}.stderr"
+
+        local tmp_blob
+        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
+        printf '%s' "$stderr_val" > "$tmp_blob"
+        sync "$tmp_blob" 2>/dev/null || true
+        mv "$tmp_blob" "$blob_file"
+
+        local inline_val
+        inline_val=$(printf '%s' "$stderr_val" | head -c "$STDOUT_INLINE_LIMIT")
+
+        record=$(printf '%s' "$record" | jq \
+            --arg stderr "$inline_val" \
+            --arg ref "$blob_ref" \
+            --argjson bytes "$stderr_bytes" \
+            '. + {stderr: $stderr, stderr_ref: $ref, stderr_bytes: $bytes, stderr_truncated: true}')
+    fi
+
+    # Append row to trajectory.jsonl (compact, one line).
+    mkdir -p "$shellm_dir"
+    local compact
+    compact=$(printf '%s' "$record" | jq -c .)
+    printf '%s\n' "$compact" >> "$traj_file"
+
+    # Print the assigned step_id so the caller knows it.
+    printf '%s\n' "$step_id"
+}
+
+# ---------------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------------
+
+cmd_show() {
+    local run_dir="" step="" full=0 field=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full)  full=1; shift ;;
+            --field) field="${2:?--field requires a value}"; shift 2 ;;
+            -*)      die "show: unknown option: $1" ;;
+            *)
+                if [[ -z "$run_dir" ]]; then
+                    run_dir="$1"
+                elif [[ -z "$step" ]]; then
+                    step="$1"
+                else
+                    die "show: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || die "show requires <run_dir>"
+    [[ -n "$step" ]] || die "show requires <step>"
+
+    local shellm_dir="$run_dir/.shellm"
+    local traj_file="$shellm_dir/$TRAJ_FILE"
+    [[ -f "$traj_file" ]] || die "show: trajectory not found: $traj_file"
+
+    local row
+    row=$(jq -c --arg id "$step" 'select(.step_id == $id)' "$traj_file" | head -1)
+    [[ -n "$row" ]] || die "show: step $step not found"
+
+    # If --full, replace truncated stdout/stderr with blob contents.
+    if [[ "$full" -eq 1 ]]; then
+        local stdout_ref
+        stdout_ref=$(printf '%s' "$row" | jq -r '.stdout_ref // empty')
+        if [[ -n "$stdout_ref" ]]; then
+            local blob_path="$shellm_dir/$stdout_ref"
+            if [[ -f "$blob_path" ]]; then
+                local full_stdout
+                full_stdout=$(cat "$blob_path")
+                row=$(printf '%s' "$row" | jq --arg v "$full_stdout" '.stdout = $v | del(.stdout_truncated)')
+            fi
+        fi
+        local stderr_ref
+        stderr_ref=$(printf '%s' "$row" | jq -r '.stderr_ref // empty')
+        if [[ -n "$stderr_ref" ]]; then
+            local blob_path="$shellm_dir/$stderr_ref"
+            if [[ -f "$blob_path" ]]; then
+                local full_stderr
+                full_stderr=$(cat "$blob_path")
+                row=$(printf '%s' "$row" | jq --arg v "$full_stderr" '.stderr = $v | del(.stderr_truncated)')
+            fi
+        fi
+    fi
+
+    # If --field, emit just that field's raw bytes.
+    if [[ -n "$field" ]]; then
+        case "$field" in
+            stdout|stderr|cmd|thought)
+                # For stdout/stderr with --full, might need to read blob.
+                if [[ "$full" -eq 1 ]]; then
+                    printf '%s' "$row" | jq -r ".${field} // empty"
+                else
+                    # Check if there's a blob ref for this field and we want full.
+                    printf '%s' "$row" | jq -r ".${field} // empty"
+                fi
+                ;;
+            *) die "show: unknown field: $field (expected stdout|stderr|cmd|thought)" ;;
+        esac
+        return
+    fi
+
+    # Pretty-print the step.
+    printf '%s' "$row" | jq .
+}
+
+# ---------------------------------------------------------------------------
+# tail
+# ---------------------------------------------------------------------------
+
+cmd_tail() {
+    local run_dir="" n=10 follow=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) n="${2:?-n requires a number}"; shift 2 ;;
+            -f) follow=1; shift ;;
+            -*) die "tail: unknown option: $1" ;;
+            *)
+                if [[ -z "$run_dir" ]]; then
+                    run_dir="$1"
+                else
+                    die "tail: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || die "tail requires <run_dir>"
+
+    local traj_file="$run_dir/.shellm/$TRAJ_FILE"
+    [[ -f "$traj_file" ]] || die "tail: trajectory not found: $traj_file"
+
+    if [[ "$follow" -eq 1 ]]; then
+        tail -n "$n" -f "$traj_file" | while IFS= read -r line; do
+            printf '%s\n' "$line" | jq -c . 2>/dev/null || printf '%s\n' "$line"
+        done
+    else
+        tail -n "$n" "$traj_file"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+cmd_search() {
+    local run_dir="" pattern="" field="all" case_flag="" context_lines=0 use_regex=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --field) field="${2:?--field requires a value}"; shift 2 ;;
+            -i)      case_flag="-i"; shift ;;
+            -C)      context_lines="${2:?-C requires a number}"; shift 2 ;;
+            -E)      use_regex=1; shift ;;
+            -*)      die "search: unknown option: $1" ;;
+            *)
+                if [[ -z "$run_dir" ]]; then
+                    run_dir="$1"
+                elif [[ -z "$pattern" ]]; then
+                    pattern="$1"
+                else
+                    die "search: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || die "search requires <run_dir>"
+    [[ -n "$pattern" ]] || die "search requires <pattern>"
+
+    local shellm_dir="$run_dir/.shellm"
+    local traj_file="$shellm_dir/$TRAJ_FILE"
+    [[ -f "$traj_file" ]] || die "search: trajectory not found: $traj_file"
+
+    local fields_to_search
+    case "$field" in
+        all) fields_to_search="thought cmd stdout stderr" ;;
+        thought|cmd|stdout|stderr) fields_to_search="$field" ;;
+        *) die "search: unknown field: $field" ;;
+    esac
+
+    local grep_mode="-F"  # literal by default
+    [[ "$use_regex" -eq 1 ]] && grep_mode="-E"
+
+    local -a grep_args=($grep_mode)
+    [[ -n "$case_flag" ]] && grep_args+=($case_flag)
+    [[ "$context_lines" -gt 0 ]] && grep_args+=(-C "$context_lines")
+    grep_args+=(-n)  # line numbers
+
+    # Iterate over each row in the trajectory.
+    while IFS= read -r row; do
+        local step_id
+        step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
+        [[ -n "$step_id" ]] || continue
+
+        for f in $fields_to_search; do
+            local content=""
+
+            # For stdout/stderr, check if there's a blob and use that for full search.
+            local ref_key="${f}_ref"
+            local ref_val
+            ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
+
+            if [[ -n "$ref_val" ]] && [[ -f "$shellm_dir/$ref_val" ]]; then
+                content=$(cat "$shellm_dir/$ref_val")
+            else
+                content=$(printf '%s' "$row" | jq -r ".${f} // empty")
+            fi
+
+            [[ -n "$content" ]] || continue
+
+            # Search the content.
+            local matches
+            matches=$(printf '%s\n' "$content" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
+            [[ -n "$matches" ]] || continue
+
+            # Format output: <step>:<field>:<line_no>: <line>
+            while IFS= read -r match_line; do
+                printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
+            done <<< "$matches"
+        done
+    done < "$traj_file"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+[[ $# -gt 0 ]] || usage 1
+cmd="$1"; shift
+case "$cmd" in
+    append) cmd_append "$@" ;;
+    show)   cmd_show "$@" ;;
+    tail)   cmd_tail "$@" ;;
+    search) cmd_search "$@" ;;
+    help|-h|--help) usage 0 ;;
+    *) die "unknown command: $cmd" ;;
+esac

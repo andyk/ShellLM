@@ -3,7 +3,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 SYMLINKS="${SYMLINKS:-0}"
-TOOLS=(shellm shellm-docker shellm-docker-broker shelly skills mem llm shellm-explore)
+TOOLS=(shellm shellm-docker shellm-docker-broker shelly skills mem llm shellm-explore context traj)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13,7 +13,7 @@ while [[ $# -gt 0 ]]; do
             cat <<'EOF'
 Usage: ./install.sh [options]
 
-Installs shellm, shellm-docker, shellm-docker-broker, shellm-explore, shelly, skills, and mem to a directory on your PATH.
+Installs shellm tools from bin/ to a directory on your PATH.
 
 Options:
   --prefix DIR   Install directory (default: ~/.local/bin)
@@ -40,10 +40,10 @@ mkdir -p "$PREFIX"
 
 for tool in "${TOOLS[@]}"; do
     if [[ "$SYMLINKS" -eq 1 ]]; then
-        ln -sf "$(pwd)/$tool" "$PREFIX/$tool"
+        ln -sf "$(pwd)/bin/$tool" "$PREFIX/$tool"
         echo "Linked $tool → $PREFIX/$tool"
     else
-        cp "$tool" "$PREFIX/$tool"
+        cp "bin/$tool" "$PREFIX/$tool"
         chmod +x "$PREFIX/$tool"
         echo "Installed $tool → $PREFIX/$tool"
     fi
