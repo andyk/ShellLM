@@ -14,6 +14,7 @@ SHELLY_MODEL="${SHELLY_MODEL:-${SHELLM_MODEL:-claude-opus-4-6}}"
 SHELLY_MEMORIES_DIR=""
 SHELLY_SKILLS_DIR=""
 SHELLY_KERNEL_DIR=""
+SHELLY_TRAJ_DIR=""
 VERBOSE=0
 
 # Source per-repo rc file (flags > env vars > rc file)
@@ -65,7 +66,8 @@ ensure_persona() {
     SHELLY_MEMORIES_DIR="$persona_dir/memories"
     SHELLY_SKILLS_DIR="$persona_dir/skills"
     SHELLY_KERNEL_DIR="$persona_dir/kernel"
-    mkdir -p "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR" "$SHELLY_KERNEL_DIR"
+    SHELLY_TRAJ_DIR="$persona_dir/traj"
+    mkdir -p "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR" "$SHELLY_KERNEL_DIR" "$SHELLY_TRAJ_DIR"
     ensure_kernel
 }
 
@@ -121,7 +123,7 @@ MEMSKILL
 # Context assembly
 # ---------------------------------------------------------------------------
 
-assemble_context() {
+build_shelly_system_prompt() {
     local persona_dir="$1"
     local context=""
 
@@ -155,16 +157,19 @@ ENDOFRESPONSE
 My skills are learned abilities that let me do specific things well. They are how I grow and become more capable over time. Each skill is a set of instructions I can follow to accomplish a particular type of task — like a recipe or a playbook. I can install new skills from GitHub or create my own, and they persist as part of me just like my memories. Skills are managed via \`skills\` (SKILLS_DIR is pre-set in my environment).
 
 Commands I can run:
-  skills                              List all my installed skills
-  skills <query>                      Search installed + remote skills (GitHub)
-  skills show <name>                  Print a skill's full SKILL.md
-  skills install <owner/repo|path>    Install a skill from GitHub or local path
-  skills remove <name>               Remove an installed skill
-  skills init [name]                  Scaffold a new skill
-  skills list-json                    List skills as JSON
-  skills promote <name>              Promote a skill to my kernel (always loaded)
-  skills demote <name>               Demote a kernel skill back to on-demand
-  skills kernel                      Show kernel skills with token counts
+  skills                                    List all my installed skills
+  skills <query>                            Search installed + remote skills
+  skills show <name>                        Print a skill's full SKILL.md
+  skills install <name|owner/repo|url|path> Install a skill (by name from remotes, GitHub, or local path)
+  skills remove <name>                      Remove an installed skill
+  skills init [name]                        Scaffold a new skill
+  skills list-json                          List skills as JSON
+  skills promote <name>                     Promote a skill to my kernel (always loaded)
+  skills demote <name>                      Demote a kernel skill back to on-demand
+  skills kernel                             Show kernel skills with token counts
+  skills remote                             List configured skill remotes
+  skills remote add <url|path>              Add a skill remote
+  skills remote remove <url|path>           Remove a skill remote
 
 My kernel skills are always loaded into my context. Regular skills are on-demand — I load them with \`skills show <name>\` when needed.
 When the user asks me to use a skill, I read it with \`skills show <name>\` and follow its instructions."
@@ -177,7 +182,7 @@ When the user asks me to use a skill, I read it with \`skills show <name>\` and 
             [[ -f "${skill_dir}SKILL.md" ]] || continue
             local skill_body
             # Strip YAML frontmatter (between --- markers)
-            skill_body=$(sed -n '/^---$/,/^---$/d; p' "${skill_dir}SKILL.md")
+            skill_body=$(sed '/^---$/,/^---$/d' "${skill_dir}SKILL.md")
             if [[ -n "$skill_body" ]]; then
                 kernel_content="${kernel_content}
 ${skill_body}"
@@ -208,8 +213,8 @@ $memories"
         for skill_dir in "$persona_dir/skills"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
             local sname sdesc
-            sname=$(sed -n '/^---$/,/^---$/{ /^name:/{ s/^name:[[:space:]]*//; s/^["'"'"']\(.*\)["'"'"']$/\1/; p; } }' "${skill_dir}SKILL.md")
-            sdesc=$(sed -n '/^---$/,/^---$/{ /^description:/{ s/^description:[[:space:]]*//; s/^["'"'"']\(.*\)["'"'"']$/\1/; p; } }' "${skill_dir}SKILL.md")
+            sname=$(sed -n '/^---$/,/^---$/p' "${skill_dir}SKILL.md" | grep '^name:' | sed 's/^name:[[:space:]]*//' | sed "s/^[\"']\(.*\)[\"']$/\1/")
+            sdesc=$(sed -n '/^---$/,/^---$/p' "${skill_dir}SKILL.md" | grep '^description:' | sed 's/^description:[[:space:]]*//' | sed "s/^[\"']\(.*\)[\"']$/\1/")
             [[ -z "$sname" ]] && sname=$(basename "$skill_dir")
             skills_summary="${skills_summary}  - ${sname}: ${sdesc}
 "
@@ -222,8 +227,6 @@ $memories"
 $skills_summary"
     fi
 
-    # Write assembled context
-    printf '%s' "$context" > "$persona_dir/context.txt"
     printf '%s' "$context"
 }
 
@@ -243,26 +246,22 @@ cmd_send() {
     ensure_persona
     local persona_dir
     persona_dir=$(resolve_persona)
+    local traj_dir="$persona_dir/traj"
 
-    local ts
-    ts=$(iso_timestamp)
+    # Record user message to traj
+    printf '{"type":"human-msg","content":%s}' "$(printf '%s' "$message" | jq -Rsa .)" \
+        | traj append "$traj_dir" >/dev/null
 
-    # Append user message to history
-    local user_json
-    user_json=$(jq -nc --arg role "user" --arg content "$message" --arg ts "$ts" \
-        '{role:$role, content:$content, ts:$ts}')
-    printf '%s\n' "$user_json" >> "$persona_dir/history.jsonl"
+    # Build system prompt (persona + skills + kernel + memories)
+    local system_prompt
+    system_prompt=$(build_shelly_system_prompt "$persona_dir")
 
-    # Assemble context (personality, kernel skills, memories, available skills)
-    local context
-    context=$(assemble_context "$persona_dir")
-
-    # Prepend context to user message so shellm keeps its own system prompt
-    local full_message="<context>
-$context
-</context>
-
-$message"
+    # Build messages from traj via context
+    local messages
+    messages=$(context "$traj_dir" \
+        --assistant-types agent-msg \
+        --user-types human-msg \
+        --exclude-types agent-run 2>/dev/null) || messages='[]'
 
     # Run shellm in background so Ctrl+C can interrupt it
     local run_dir="$persona_dir/run"
@@ -279,11 +278,40 @@ $message"
     local persona_name
     persona_name=$(basename "$(readlink "$SHELLY_DIR/personas/current")")
 
+    # Build the prompt for shellm: system context + conversation history + current message.
+    # shellm is unaware of shelly — it just receives this as its prompt string.
+    # Prior conversation turns come from shelly's persistent trajectory via context.
+    local chat_history=""
+    local turn_count
+    turn_count=$(printf '%s' "$messages" | jq 'length') || turn_count=0
+    if [[ "$turn_count" -gt 1 ]]; then
+        # All turns except the last (which is the message we're about to send).
+        # Render as simple labeled turns so the model sees the conversation.
+        chat_history=$(printf '%s' "$messages" | jq -r --arg name "$persona_name" '
+            .[:-1][] |
+            if .role == "user" then "Human: " + .content
+            else ($name + ": " + .content) end
+        ')
+    fi
+
+    local full_message="<context>
+$system_prompt
+</context>
+"
+    if [[ -n "$chat_history" ]]; then
+        full_message+="
+<conversation-history>
+$chat_history
+</conversation-history>
+"
+    fi
+    full_message+="$message"
+
     SHELLM_NO_BANNER=1 SHELLM_MODEL="$SHELLY_MODEL" \
         shellm --env "$persona_name" --workdir "$run_dir" \
         --var "MEM_DIR=$abs_mem_dir" \
         --var "SKILLS_DIR=$abs_skills_dir" \
-        --var "SHELLY_KERNEL_DIR=$abs_kernel_dir" \
+        --var "SKILLS_KERNEL_DIR=$abs_kernel_dir" \
         --bin "$(command -v mem)" \
         --bin "$(command -v skills)" \
         "$full_message" > "$response_file" &
@@ -311,16 +339,9 @@ $message"
         printf '%s\n' "$response"
     fi
 
-    # Append assistant message to history
-    local reply_ts
-    reply_ts=$(iso_timestamp)
-    local abs_run_dir
-    abs_run_dir=$(cd "$run_dir" 2>/dev/null && pwd) || abs_run_dir="$run_dir"
-    local assistant_json
-    assistant_json=$(jq -nc --arg role "assistant" --arg content "${response:-}" \
-        --arg ts "$reply_ts" --arg shellm_dir "$abs_run_dir" \
-        '{role:$role, content:$content, ts:$ts, shellm_dir:$shellm_dir}')
-    printf '%s\n' "$assistant_json" >> "$persona_dir/history.jsonl"
+    # Record assistant response to traj
+    printf '{"type":"agent-msg","content":%s}' "$(printf '%s' "${response:-}" | jq -Rsa .)" \
+        | traj append "$traj_dir" >/dev/null
 }
 
 cmd_repl() {
@@ -437,10 +458,10 @@ cmd_repl() {
                 ;;
             /skills\ *)
                 local skills_args="${input#/skills }"
-                eval SKILLS_DIR=\"\$SHELLY_SKILLS_DIR\" SHELLY_KERNEL_DIR=\"\$SHELLY_KERNEL_DIR\" skills $skills_args
+                eval SKILLSRC=\"\$SHELLY_SKILLS_DIR/.skillsrc\" SKILLS_DIR=\"\$SHELLY_SKILLS_DIR\" SKILLS_KERNEL_DIR=\"\$SHELLY_KERNEL_DIR\" skills $skills_args
                 ;;
             /skills)
-                SKILLS_DIR="$SHELLY_SKILLS_DIR" SHELLY_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills
+                SKILLSRC="$SHELLY_SKILLS_DIR/.skillsrc" SKILLS_DIR="$SHELLY_SKILLS_DIR" SKILLS_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills
                 ;;
             /help)
                 repl_help
@@ -475,11 +496,14 @@ Slash commands:
   /skills               List installed skills
   /skills <query>       Search installed + remote skills
   /skills show <name>   Print a skill's SKILL.md
-  /skills install <src> Install a skill
+  /skills install <name|src> Install a skill
   /skills remove <name> Remove a skill
   /skills init [name]   Scaffold a new skill
   /skills promote <name> Promote skill to kernel
   /skills demote <name>  Demote kernel skill
+  /skills remote        List configured remotes
+  /skills remote add <url|path>    Add a remote
+  /skills remote remove <url|path> Remove a remote
   /quit           Exit the repl
 EOF
 }
@@ -505,11 +529,8 @@ cmd_new() {
     cwd=$(pwd)
     printf 'name=%s\ncwd=%s\ncreated=%s\n' "$name" "$cwd" "$(iso_timestamp)" > "$persona_dir/info.txt"
 
-    # Initialize empty history
-    : > "$persona_dir/history.jsonl"
-
-    # Create per-persona dirs
-    mkdir -p "$persona_dir/memories" "$persona_dir/skills" "$persona_dir/kernel"
+    # Create per-persona dirs (traj replaces history.jsonl)
+    mkdir -p "$persona_dir/memories" "$persona_dir/skills" "$persona_dir/kernel" "$persona_dir/traj"
 
     # Bootstrap kernel (mem SKILL.md)
     SHELLY_KERNEL_DIR="$persona_dir/kernel"
@@ -631,24 +652,55 @@ cmd_history() {
     ensure_persona
     local persona_dir
     persona_dir=$(resolve_persona)
+    local traj_dir="$persona_dir/traj"
 
-    local hist="$persona_dir/history.jsonl"
-    if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
+    # Try traj first, fall back to legacy history.jsonl
+    local traj_file
+    traj_file=$(traj_resolve_file "$traj_dir")
+
+    if [[ -z "$traj_file" ]]; then
         echo "(empty history)" >&2
         return
     fi
 
     while IFS= read -r line; do
-        local role content
-        role=$(printf '%s' "$line" | jq -r '.role // ""')
-        content=$(printf '%s' "$line" | jq -r '.content // ""')
+        local step_type content role
+        step_type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
 
-        if [[ "$role" == "user" ]]; then
-            printf '> %s\n\n' "$content"
-        elif [[ "$role" == "assistant" ]]; then
-            printf '%s\n\n' "$content"
+        if [[ -n "$step_type" ]]; then
+            # New traj format
+            content=$(printf '%s' "$line" | jq -r '.content // empty')
+            case "$step_type" in
+                human-msg)  printf '> %s\n\n' "$content" ;;
+                agent-msg)  printf '%s\n\n' "$content" ;;
+            esac
+        else
+            # Legacy history.jsonl format
+            role=$(printf '%s' "$line" | jq -r '.role // ""')
+            content=$(printf '%s' "$line" | jq -r '.content // ""')
+            if [[ "$role" == "user" ]]; then
+                printf '> %s\n\n' "$content"
+            elif [[ "$role" == "assistant" ]]; then
+                printf '%s\n\n' "$content"
+            fi
         fi
-    done < "$hist"
+    done < "$traj_file"
+}
+
+# Resolve the file to read history from: traj root.jsonl, legacy trajectory.jsonl,
+# or legacy history.jsonl. Returns empty string if no history exists.
+traj_resolve_file() {
+    local traj_dir="$1"
+    local persona_dir
+    persona_dir=$(dirname "$traj_dir")
+
+    if [[ -f "$traj_dir/root.jsonl" ]] && [[ -s "$traj_dir/root.jsonl" ]]; then
+        printf '%s' "$traj_dir/root.jsonl"
+    elif [[ -f "$traj_dir/trajectory.jsonl" ]] && [[ -s "$traj_dir/trajectory.jsonl" ]]; then
+        printf '%s' "$traj_dir/trajectory.jsonl"
+    elif [[ -f "$persona_dir/history.jsonl" ]] && [[ -s "$persona_dir/history.jsonl" ]]; then
+        printf '%s' "$persona_dir/history.jsonl"
+    fi
 }
 
 cmd_reset() {
@@ -669,8 +721,12 @@ cmd_reset() {
         rm -rf "$ws_dir"
     fi
 
-    # Truncate history
-    : > "$persona_dir/history.jsonl"
+    # Clear traj directory
+    rm -rf "$persona_dir/traj"
+    mkdir -p "$persona_dir/traj"
+
+    # Also clear legacy history if present
+    rm -f "$persona_dir/history.jsonl"
 
     # Remove shellm workdir
     rm -rf "$persona_dir/run"
@@ -683,27 +739,42 @@ cmd_compact() {
     ensure_persona
     local persona_dir
     persona_dir=$(resolve_persona)
+    local traj_dir="$persona_dir/traj"
 
-    local hist="$persona_dir/history.jsonl"
-    if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
+    local traj_file
+    traj_file=$(traj_resolve_file "$traj_dir")
+
+    if [[ -z "$traj_file" ]]; then
         echo "Nothing to compact." >&2
         return
     fi
 
-    # Build conversation text from history
+    # Build conversation text from traj (or legacy history)
     local conversation=""
     while IFS= read -r line; do
-        local role content
-        role=$(printf '%s' "$line" | jq -r '.role // ""')
-        content=$(printf '%s' "$line" | jq -r '.content // ""')
-        if [[ "$role" == "user" ]]; then
-            conversation="${conversation}User: ${content}
+        local step_type content role
+        step_type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
+
+        if [[ -n "$step_type" ]]; then
+            content=$(printf '%s' "$line" | jq -r '.content // empty')
+            case "$step_type" in
+                human-msg)  conversation="${conversation}User: ${content}
+" ;;
+                agent-msg)  conversation="${conversation}Assistant: ${content}
+" ;;
+            esac
+        else
+            role=$(printf '%s' "$line" | jq -r '.role // ""')
+            content=$(printf '%s' "$line" | jq -r '.content // ""')
+            if [[ "$role" == "user" ]]; then
+                conversation="${conversation}User: ${content}
 "
-        elif [[ "$role" == "assistant" ]]; then
-            conversation="${conversation}Assistant: ${content}
+            elif [[ "$role" == "assistant" ]]; then
+                conversation="${conversation}Assistant: ${content}
 "
+            fi
         fi
-    done < "$hist"
+    done < "$traj_file"
 
     # Summarize using llm
     printf 'Compacting history...\n' >&2
@@ -716,14 +787,14 @@ ${conversation}") || {
         die "Failed to compact history"
     }
 
-    # Replace history with summary
-    local ts
-    ts=$(iso_timestamp)
-    printf '' > "$hist"
-    local sys_json
-    sys_json=$(jq -nc --arg role "assistant" --arg content "[Compacted] $summary" --arg ts "$ts" \
-        '{role:$role, content:$content, ts:$ts}')
-    printf '%s\n' "$sys_json" > "$hist"
+    # Replace traj with compacted summary
+    rm -rf "$traj_dir"
+    mkdir -p "$traj_dir"
+    printf '{"type":"agent-msg","content":%s}' "$(printf '%s' "[Compacted] $summary" | jq -Rsa .)" \
+        | traj append "$traj_dir" >/dev/null
+
+    # Also remove legacy history if present
+    rm -f "$persona_dir/history.jsonl"
 
     # Destroy the Docker workspace for this persona
     local persona_name
@@ -758,8 +829,7 @@ cmd_context() {
     ensure_persona
     local persona_dir
     persona_dir=$(resolve_persona)
-    assemble_context "$persona_dir" >/dev/null
-    cat "$persona_dir/context.txt"
+    build_shelly_system_prompt "$persona_dir"
     printf '\n'
 }
 
@@ -791,15 +861,18 @@ Memory:
   shelly mem edit <name> <text> Update a memory's body
 
 Skills:
-  shelly skills                List installed skills
-  shelly skills <query>        Search installed + remote skills
-  shelly skills show <name>    Print a skill's SKILL.md
-  shelly skills install <src>  Install a skill (owner/repo, URL, or path)
-  shelly skills remove <name>  Remove an installed skill
-  shelly skills init [name]    Scaffold a new skill
-  shelly skills promote <name> Promote a skill to kernel
-  shelly skills demote <name>  Demote a kernel skill
-  shelly skills kernel         Show kernel skills with token counts
+  shelly skills                       List installed skills
+  shelly skills <query>               Search installed + remote skills
+  shelly skills show <name>           Print a skill's SKILL.md
+  shelly skills install <name|src>    Install a skill (name, owner/repo, URL, or path)
+  shelly skills remove <name>        Remove an installed skill
+  shelly skills init [name]          Scaffold a new skill
+  shelly skills promote <name>       Promote a skill to kernel
+  shelly skills demote <name>        Demote a kernel skill
+  shelly skills kernel               Show kernel skills with token counts
+  shelly skills remote               List configured skill remotes
+  shelly skills remote add <url|path>    Add a skill remote
+  shelly skills remote remove <url|path> Remove a skill remote
 
 Options:
   --model MODEL           Model to use (default: claude-opus-4-6)
@@ -901,7 +974,7 @@ main() {
             MEM_DIR="$SHELLY_MEMORIES_DIR" mem "$@"
             ;;
         skills)
-            SKILLS_DIR="$SHELLY_SKILLS_DIR" SHELLY_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills "$@"
+            SKILLSRC="$SHELLY_SKILLS_DIR/.skillsrc" SKILLS_DIR="$SHELLY_SKILLS_DIR" SKILLS_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills "$@"
             ;;
         help)
             cmd_help

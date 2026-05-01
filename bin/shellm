@@ -217,11 +217,12 @@ _shellm_time() {
 
 # Append a step record to the trajectory via the `traj` tool.
 # Reads the record from a JSON string argument (not stdin, for convenience).
+# traj_dir is <rundir>/.shellm/traj
 traj_append_step() {
-    local run_dir="$1"
+    local traj_dir="$1"
     shift
     local json="$1"
-    printf '%s' "$json" | traj append "$run_dir"
+    printf '%s' "$json" | traj append "$traj_dir"
 }
 
 extract_reasoning() {
@@ -434,6 +435,20 @@ docker_prepare_container_tools() {
                 die "Could not make $_bin_name executable in shellm container"
         fi
     done
+}
+
+docker_container_has_unusable_tool_mounts() {
+    local container_id="$1"
+    local tool dest
+    for tool in llm traj context; do
+        dest="/usr/local/bin/$tool"
+        if docker exec -w / "$container_id" sh -c "mount | grep -F ' on $dest ' >/dev/null 2>&1" >/dev/null 2>&1; then
+            if ! docker exec -w / "$container_id" test -x "$dest" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done
+    return 1
 }
 
 docker_broker_start() {
@@ -866,6 +881,13 @@ env_resolve() {
         fi
         local container_id
         container_id=$(cat "$ws_dir/container_id")
+        if [[ -n "$container_id" ]] && docker_container_has_unusable_tool_mounts "$container_id"; then
+            if [[ "$explicit" -eq 1 ]]; then
+                die "Env $name has stale or unusable shellm tool mounts. Use a different --env or remove ~/.shellm/envs/$name so shellm can recreate it."
+            fi
+            progress "Skipping env $name because its shellm tool mounts are stale"
+            return 1
+        fi
         if [[ -n "$container_id" ]] && docker_attach "$container_id"; then
             return 0
         fi
@@ -891,6 +913,7 @@ env_find_running() {
         local state
         state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null) || continue
         if [[ "$state" == "running" ]]; then
+            docker_container_has_unusable_tool_mounts "$cid" && continue
             printf '%s\n' "$name"
             return 0
         fi
@@ -1197,19 +1220,20 @@ IMPORTANT: End your response with exactly ONE ```bash code block. Your response 
 - Recursive self-calling: you can recursively make shellm sub-calls
 
 ## Trajectory and context
-The trajectory is the lossless record of this run; what you see in the user message is the context — a filtered, bounded view of the trajectory produced by `context`. Large outputs may be truncated with a stub.
+The trajectory is the lossless record of this run stored at `$SHELLM_RUNDIR/.shellm/traj/`. Your conversation history is presented as multi-turn messages (your reasoning as assistant, execution output as user) produced by `context`. Large outputs may be truncated with a stub.
+
+The trajectory directory is `$SHELLM_RUNDIR/.shellm/traj`. Nested `shellm` calls create child run directories under `$SHELLM_RUNDIR`; use that child's traj directory with `context` or `traj` when you need to inspect a sub-run.
 
 When you see a truncation stub like `[... truncated: N bytes total. ...]`, you can retrieve the full content:
-- `traj show $SHELLM_RUNDIR <step_id> --full` — show a step with full untruncated output
-- `traj show $SHELLM_RUNDIR <step_id> --field stdout` — emit just the stdout bytes (pipe to head/tail/grep)
-- `traj search $SHELLM_RUNDIR "<pattern>"` — search across all steps (includes spilled blobs)
-- `traj search $SHELLM_RUNDIR "<pattern>" --field stdout -i` — search stdout only, case-insensitive
-- `traj tail $SHELLM_RUNDIR -n 5` — show last 5 raw trajectory records
+- `traj show "$SHELLM_RUNDIR/.shellm/traj" <step_id> --full` — show a step with full untruncated output
+- `traj show "$SHELLM_RUNDIR/.shellm/traj" <step_id> --field stdout` — emit just the stdout bytes (pipe to head/tail/grep)
+- `traj search "$SHELLM_RUNDIR/.shellm/traj" "<pattern>"` — search across all steps (includes spilled blobs)
+- `traj search "$SHELLM_RUNDIR/.shellm/traj" "<pattern>" --field stdout -i` — search stdout only, case-insensitive
+- `traj tail "$SHELLM_RUNDIR/.shellm/traj" -n 5` — show last 5 raw trajectory records
 
 You can also re-render context with different options:
-- `context $SHELLM_RUNDIR --tail 100` — see more history
-- `context $SHELLM_RUNDIR --pin <step_id>` -- ensure a specific step is included
-- `context $SHELLM_RUNDIR --fields cmd,stdout` — show only code and output
+- `context "$SHELLM_RUNDIR/.shellm/traj" --tail 100` — see more history
+- `context "$SHELLM_RUNDIR/.shellm/traj" --pin <step_id>` -- ensure a specific step is included
 
 ## Signaling completion
 When you have the answer, set one of these in your bash code:
@@ -1277,6 +1301,13 @@ SYSPROMPT
             echo "## Docker access"
             echo "The docker CLI talks to an inner Docker daemon running inside this shellm container. The outer container is privileged, so this is not a strong sandbox."
         fi
+    fi
+
+    if [[ -n "$rundir" ]]; then
+        echo ""
+        echo "## Current run"
+        echo "- Run directory: $rundir"
+        echo "- In executed bash, this path is available as \$SHELLM_RUNDIR."
     fi
 
     # Append context documentation if any context was provided
@@ -1487,7 +1518,7 @@ run_loop() {
     else
         rundir="$HOME/.shellm/runs/$run_name"
     fi
-    mkdir -p "$rundir/.shellm"
+    mkdir -p "$rundir/.shellm/traj"
 
     # Track root rundir for the run tree
     if [[ -n "${_SHELLM_PARENT_RUNDIR:-}" ]]; then
@@ -1608,7 +1639,7 @@ run_loop() {
     printf '%s\n' "$ws_name" > "$rundir/.shellm/env"
 
     # Build system prompt
-    system_prompt=$(build_system_prompt "$context_info" "$_SHELLM_DOCKER_MODE")
+    system_prompt=$(build_system_prompt "$context_info" "$_SHELLM_DOCKER_MODE" "$rundir")
 
     # Kick off async context summary generation (background)
     local _ctx_summary_pid=""
@@ -1624,7 +1655,7 @@ run_loop() {
 
     # Initialize conversation history
     # Write initial prompt to trajectory
-    traj_append_step "$rundir" "$(jq -n --arg p "$prompt" '{prompt:$p}')"
+    traj_append_step "$rundir/.shellm/traj" "$(jq -n --arg p "$prompt" '{type:"prompt",content:$p}')" >/dev/null
 
     # --- Cleanup trap ---
     _cleanup_docker="$docker_active"
@@ -1687,10 +1718,11 @@ run_loop() {
         [[ "$QUIET" -eq 0 ]] && echo >&2
         progress "Iteration $iter_label — calling Claude API..."
 
-        # Build model context from trajectory
-        local context_output
-        context_output=$(context "$rundir" 2>/dev/null) || true
-        messages_json=$(jq -n --arg c "$context_output" '[{"role":"user","content":$c}]')
+        # Build model context from trajectory as multi-turn messages
+        messages_json=$(context "$rundir/.shellm/traj" \
+            --assistant-types reasoning,final \
+            --user-types prompt,shell-output,feedback \
+            --exclude-types sub-run 2>/dev/null) || messages_json='[]'
 
         # Call Claude (capture thinking/reasoning to file)
         local thinking_file="$rundir/.shellm/.last_thinking"
@@ -1761,7 +1793,7 @@ run_loop() {
             debug "No code extracted, treating full response as final answer"
             progress "No code block found — returning response as answer"
             # Record as a final step with no cmd
-            traj_append_step "$rundir" "$(jq -n --arg t "$reasoning" --arg f "$response" '{thought:$t, final:$f}')" >/dev/null
+            traj_append_step "$rundir/.shellm/traj" "$(jq -n --arg t "$reasoning" --arg f "$response" '{type:"final",thought:$t,content:$f}')" >/dev/null
             echo "$response"
             return 0
         fi
@@ -1953,8 +1985,36 @@ exit \$__shellm_rc
         local clean_output
         clean_output=$(printf '%s' "$output" | grep -v '^+\+ ' | grep -v '^+ ' || true)
 
-        # Build and record step to trajectory
-        local step_json
+        # Record reasoning step (assistant role in multi-turn)
+        local reasoning_json
+        reasoning_json=$(jq -n \
+            --arg thought "$reasoning" \
+            --arg cmd "$code" \
+            '{type:"reasoning", thought:$thought, cmd:$cmd}')
+
+        # Check for final answer before recording output
+        if [[ -f "$rundir/.shellm/final" ]]; then
+            [[ "$QUIET" -eq 0 ]] && echo >&2
+            progress "Final answer received"
+            local final_answer
+            final_answer=$(cat "$rundir/.shellm/final")
+            # Record as a final step instead of reasoning
+            traj_append_step "$rundir/.shellm/traj" "$(jq -n \
+                --arg thought "$reasoning" \
+                --arg cmd "$code" \
+                --arg content "$final_answer" \
+                '{type:"final", thought:$thought, cmd:$cmd, content:$content}')" >/dev/null
+            redact_sensitive "$final_answer"
+            [[ "$QUIET" -eq 0 ]] && echo >&2
+            progress_dim "Run: $rundir"
+            return 0
+        fi
+
+        # Record reasoning step
+        traj_append_step "$rundir/.shellm/traj" "$reasoning_json" >/dev/null
+
+        # Record shell-output step (user role in multi-turn)
+        local output_json
         if [[ "$timed_out" -eq 1 ]]; then
             local tail_bytes
             tail_bytes=$(printf '%s' "$output" | tail -c 500)
@@ -1962,41 +2022,29 @@ exit \$__shellm_rc
             prompt_type=$(detect_interactive_prompt "$tail_bytes")
             local feedback
             feedback=$(build_inactivity_feedback "$output" "$prompt_type" "$SHELLM_INACTIVITY_TIMEOUT")
-            step_json=$(jq -n \
-                --arg thought "$reasoning" \
-                --arg cmd "$code" \
+            output_json=$(jq -n \
                 --arg stdout "$clean_output" \
                 --arg stderr "" \
-                --argjson exit_code "$exit_code" \
+                --argjson exit "$exit_code" \
                 --arg feedback "$feedback" \
-                '{thought:$thought, cmd:$cmd, stdout:$stdout, stderr:$stderr, exit:$exit_code, timed_out:true, feedback:$feedback}')
+                '{type:"shell-output", stdout:$stdout, stderr:$stderr, exit:$exit, timed_out:true, feedback:$feedback}')
         else
-            step_json=$(jq -n \
-                --arg thought "$reasoning" \
-                --arg cmd "$code" \
+            output_json=$(jq -n \
                 --arg stdout "$clean_output" \
                 --arg stderr "" \
-                --argjson exit_code "$exit_code" \
-                '{thought:$thought, cmd:$cmd, stdout:$stdout, stderr:$stderr, exit:$exit_code}')
+                --argjson exit "$exit_code" \
+                '{type:"shell-output", stdout:$stdout, stderr:$stderr, exit:$exit}')
         fi
 
-        # Check for final answer
-        if [[ -f "$rundir/.shellm/final" ]]; then
-            [[ "$QUIET" -eq 0 ]] && echo >&2
-            progress "Final answer received"
-            local final_answer
-            final_answer=$(cat "$rundir/.shellm/final")
-            # Record final step with the answer
-            step_json=$(printf '%s' "$step_json" | jq --arg f "$final_answer" '. + {final: $f}')
-            traj_append_step "$rundir" "$step_json" >/dev/null
-            redact_sensitive "$final_answer"
-            [[ "$QUIET" -eq 0 ]] && echo >&2
-            progress_dim "Run: $rundir"
-            return 0
+        # Also record as feedback step if timed out
+        if [[ "$timed_out" -eq 1 ]]; then
+            traj_append_step "$rundir/.shellm/traj" "$output_json" >/dev/null
+            local feedback_json
+            feedback_json=$(jq -n --arg content "$feedback" '{type:"feedback", content:$content}')
+            traj_append_step "$rundir/.shellm/traj" "$feedback_json" >/dev/null
+        else
+            traj_append_step "$rundir/.shellm/traj" "$output_json" >/dev/null
         fi
-
-        # Append step to trajectory
-        traj_append_step "$rundir" "$step_json" >/dev/null
     done
 
     [[ "$QUIET" -eq 0 ]] && echo >&2

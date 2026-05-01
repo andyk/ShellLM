@@ -39,12 +39,47 @@ LLM_PROMPT=""
 
 die() { echo "llm: error: $*" >&2; exit 1; }
 
+usage() {
+    cat <<'EOF'
+Usage:
+  llm [options] prompt...
+  echo prompt | llm [options]
+  llm [options] -M MESSAGES_JSON
+
+Options:
+  -m, --model MODEL        Model to use. Default: claude-sonnet-4-5-20250929
+  -s, --system TEXT        System prompt
+  -t, --max-tokens N       Max output tokens. Default: model-specific cap
+  -M, --messages JSON      Messages array JSON, e.g. [{"role":"user","content":"hi"}]
+  --stream                 Stream response text
+  --provider NAME          Provider: anthropic, openai, or gemini
+  --thinking               Request Anthropic summarized thinking
+  --effort LEVEL           Thinking effort/provider output effort
+  --raw                    Print raw non-streaming API response JSON
+  -h, --help               Show this help
+
+Environment:
+  ANTHROPIC_API_KEY        Required for Anthropic models
+  OPENAI_API_KEY           Required for OpenAI models
+  GEMINI_API_KEY           Required for Gemini models
+  LLM_API_URL              Override provider API URL
+
+Examples:
+  llm -m claude-sonnet-4-5-20250929 "explain quicksort"
+  echo "summarize this" | llm -m gpt-5
+  llm --stream --thinking -m claude-opus-4-7 "solve this carefully"
+  llm --raw -m gemini-2.0-flash "return a JSON greeting"
+EOF
+    exit "${1:-0}"
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)       usage 0 ;;
         -m|--model)      LLM_MODEL="${2:?--model requires a value}"; shift 2 ;;
         -s|--system)     LLM_SYSTEM="${2:?--system requires a value}"; shift 2 ;;
         -t|--max-tokens) LLM_MAX_TOKENS="${2:?--max-tokens requires a value}"; shift 2 ;;
@@ -54,7 +89,7 @@ while [[ $# -gt 0 ]]; do
         --thinking)      LLM_THINKING=1; shift ;;
         --effort)        LLM_EFFORT="${2:?--effort requires a value}"; shift 2 ;;
         --raw)           LLM_RAW=1; shift ;;
-        -*)              die "Unknown option: $1" ;;
+        -*)              die "Unknown option: $1 (try llm --help)" ;;
         *)               LLM_PROMPT="$*"; break ;;
     esac
 done

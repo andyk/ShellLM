@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# traj — Trajectory storage substrate for shellm.
-# Reads and writes step records to <run_dir>/.shellm/trajectory.jsonl.
-# No filtering policy; that lives in `context`.
+# traj — Trajectory DAG substrate.
+# General-purpose step log with UUID step IDs, a required `type` field,
+# and branch support.  No filtering policy; that lives in `context`.
+#
+# Directory layout:
+#   <traj_dir>/
+#     root.jsonl              # main branch
+#     <branch-name>.jsonl     # child branches
+#     blobs/                  # spilled large fields
 
 # ---------------------------------------------------------------------------
 # Defaults & constants
 # ---------------------------------------------------------------------------
 
 STDOUT_INLINE_LIMIT="${SHELLM_STDOUT_INLINE_LIMIT:-4096}"
-TRAJ_FILE="trajectory.jsonl"
-BLOB_DIR="trajectory_blobs"
 
 die() { printf 'traj: error: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -19,18 +23,22 @@ usage() {
 Usage: traj <command> [args]
 
 Commands:
-  append <run_dir>          Read a step JSON from stdin, assign step id, spill
-                            large stdout/stderr to blobs, append to trajectory.
-  show <run_dir> <step>     Pretty-print a single step.
-        [--full]            Inline blobs even if they exceed limits.
-        [--field F]         Emit just that field's bytes (stdout|stderr|cmd|thought).
-  tail <run_dir> [-n N] [-f]
-                            Like tail but for trajectory.jsonl.
-  search <run_dir> <pattern>
-        [--field F]         Search field (stdout|stderr|cmd|thought|all). Default: all.
-        [-i]                Case-insensitive.
-        [-C N]              Context lines.
-        [-E]                Extended regex (default: literal substring).
+  append <traj_dir> [--branch NAME]
+                            Read a step JSON from stdin (must have a `type`
+                            field), assign UUID step_id, spill large fields
+                            to blobs, append to the branch file.
+                            Default branch: root.
+
+  show <traj_dir> <step_id> [--branch NAME] [--full] [--field F]
+                            Pretty-print a single step.
+
+  tail <traj_dir> [--branch NAME] [-n N] [-f]
+                            Like tail but for a branch's JSONL file.
+
+  search <traj_dir> <pattern> [--branch NAME] [--field F] [-i] [-C N] [-E]
+                            Search step fields. Default field: all.
+
+  branches <traj_dir>       List all branches (one name per line).
 
 EOF
     exit "${1:-0}"
@@ -40,9 +48,19 @@ EOF
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Generate a 6-char lowercase hex step id.
+# Generate a UUID step id.
 gen_step_id() {
-    head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        # Fallback: construct from /dev/urandom
+        local hex
+        hex=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        printf '%s-%s-%s-%s-%s\n' \
+            "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+    fi
 }
 
 # Determine the next blob_id for a step by counting existing blobs.
@@ -60,15 +78,57 @@ byte_len() {
     printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
 }
 
+# Resolve the JSONL file for a branch.
+# Handles backward compatibility: if root is requested and root.jsonl
+# doesn't exist but trajectory.jsonl does, use trajectory.jsonl.
+resolve_branch_file() {
+    local traj_dir="$1" branch="$2"
+    local branch_file="$traj_dir/${branch}.jsonl"
+
+    if [[ "$branch" == "root" && ! -f "$branch_file" ]]; then
+        # Backward compat: old single-file format
+        if [[ -f "$traj_dir/trajectory.jsonl" ]]; then
+            printf '%s\n' "$traj_dir/trajectory.jsonl"
+            return
+        fi
+    fi
+    printf '%s\n' "$branch_file"
+}
+
+# Like resolve_branch_file but requires the file to exist.
+require_branch_file() {
+    local traj_dir="$1" branch="$2" cmd="$3"
+    local branch_file
+    branch_file=$(resolve_branch_file "$traj_dir" "$branch")
+    [[ -f "$branch_file" ]] || die "$cmd: branch file not found: $branch_file"
+    printf '%s\n' "$branch_file"
+}
+
 # ---------------------------------------------------------------------------
 # append
 # ---------------------------------------------------------------------------
 
 cmd_append() {
-    local run_dir="${1:?append requires <run_dir>}"
-    local shellm_dir="$run_dir/.shellm"
-    local traj_file="$shellm_dir/$TRAJ_FILE"
-    local blob_dir="$shellm_dir/$BLOB_DIR"
+    local traj_dir="" branch="root"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch) branch="${2:?--branch requires NAME}"; shift 2 ;;
+            -*)       die "append: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_dir" ]]; then
+                    traj_dir="$1"
+                else
+                    die "append: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$traj_dir" ]] || die "append requires <traj_dir>"
+
+    local branch_file
+    branch_file=$(resolve_branch_file "$traj_dir" "$branch")
+    local blob_dir="$traj_dir/blobs"
 
     # Read the step record from stdin.
     local record
@@ -77,6 +137,11 @@ cmd_append() {
 
     # Validate it's JSON.
     printf '%s' "$record" | jq empty 2>/dev/null || die "append: invalid JSON on stdin"
+
+    # Validate type field is present.
+    local step_type
+    step_type=$(printf '%s' "$record" | jq -r '.type // empty')
+    [[ -n "$step_type" ]] || die "append: step record must have a 'type' field"
 
     # Assign step id.
     local step_id
@@ -96,7 +161,7 @@ cmd_append() {
         local blob_id
         blob_id=$(next_blob_id "$blob_dir" "$step_id")
         local blob_file="$blob_dir/${step_id}-${blob_id}.stdout"
-        local blob_ref="$BLOB_DIR/${step_id}-${blob_id}.stdout"
+        local blob_ref="blobs/${step_id}-${blob_id}.stdout"
 
         # Write blob first (atomic: write to temp then rename).
         local tmp_blob
@@ -127,7 +192,7 @@ cmd_append() {
         local blob_id
         blob_id=$(next_blob_id "$blob_dir" "$step_id")
         local blob_file="$blob_dir/${step_id}-${blob_id}.stderr"
-        local blob_ref="$BLOB_DIR/${step_id}-${blob_id}.stderr"
+        local blob_ref="blobs/${step_id}-${blob_id}.stderr"
 
         local tmp_blob
         tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
@@ -145,11 +210,11 @@ cmd_append() {
             '. + {stderr: $stderr, stderr_ref: $ref, stderr_bytes: $bytes, stderr_truncated: true}')
     fi
 
-    # Append row to trajectory.jsonl (compact, one line).
-    mkdir -p "$shellm_dir"
+    # Append row to branch file (compact, one line).
+    mkdir -p "$traj_dir"
     local compact
     compact=$(printf '%s' "$record" | jq -c .)
-    printf '%s\n' "$compact" >> "$traj_file"
+    printf '%s\n' "$compact" >> "$branch_file"
 
     # Print the assigned step_id so the caller knows it.
     printf '%s\n' "$step_id"
@@ -160,15 +225,16 @@ cmd_append() {
 # ---------------------------------------------------------------------------
 
 cmd_show() {
-    local run_dir="" step="" full=0 field=""
+    local traj_dir="" step="" full=0 field="" branch="root"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --full)  full=1; shift ;;
-            --field) field="${2:?--field requires a value}"; shift 2 ;;
-            -*)      die "show: unknown option: $1" ;;
+            --full)    full=1; shift ;;
+            --field)   field="${2:?--field requires a value}"; shift 2 ;;
+            --branch)  branch="${2:?--branch requires NAME}"; shift 2 ;;
+            -*)        die "show: unknown option: $1" ;;
             *)
-                if [[ -z "$run_dir" ]]; then
-                    run_dir="$1"
+                if [[ -z "$traj_dir" ]]; then
+                    traj_dir="$1"
                 elif [[ -z "$step" ]]; then
                     step="$1"
                 else
@@ -178,23 +244,24 @@ cmd_show() {
                 ;;
         esac
     done
-    [[ -n "$run_dir" ]] || die "show requires <run_dir>"
-    [[ -n "$step" ]] || die "show requires <step>"
+    [[ -n "$traj_dir" ]] || die "show requires <traj_dir>"
+    [[ -n "$step" ]] || die "show requires <step_id>"
 
-    local shellm_dir="$run_dir/.shellm"
-    local traj_file="$shellm_dir/$TRAJ_FILE"
-    [[ -f "$traj_file" ]] || die "show: trajectory not found: $traj_file"
+    local branch_file
+    branch_file=$(require_branch_file "$traj_dir" "$branch" "show")
 
     local row
-    row=$(jq -c --arg id "$step" 'select(.step_id == $id)' "$traj_file" | head -1)
+    row=$(jq -c --arg id "$step" 'select(.step_id == $id)' "$branch_file" | head -1)
     [[ -n "$row" ]] || die "show: step $step not found"
+
+    local blob_dir="$traj_dir/blobs"
 
     # If --full, replace truncated stdout/stderr with blob contents.
     if [[ "$full" -eq 1 ]]; then
         local stdout_ref
         stdout_ref=$(printf '%s' "$row" | jq -r '.stdout_ref // empty')
         if [[ -n "$stdout_ref" ]]; then
-            local blob_path="$shellm_dir/$stdout_ref"
+            local blob_path="$traj_dir/$stdout_ref"
             if [[ -f "$blob_path" ]]; then
                 local full_stdout
                 full_stdout=$(cat "$blob_path")
@@ -204,7 +271,7 @@ cmd_show() {
         local stderr_ref
         stderr_ref=$(printf '%s' "$row" | jq -r '.stderr_ref // empty')
         if [[ -n "$stderr_ref" ]]; then
-            local blob_path="$shellm_dir/$stderr_ref"
+            local blob_path="$traj_dir/$stderr_ref"
             if [[ -f "$blob_path" ]]; then
                 local full_stderr
                 full_stderr=$(cat "$blob_path")
@@ -215,18 +282,7 @@ cmd_show() {
 
     # If --field, emit just that field's raw bytes.
     if [[ -n "$field" ]]; then
-        case "$field" in
-            stdout|stderr|cmd|thought)
-                # For stdout/stderr with --full, might need to read blob.
-                if [[ "$full" -eq 1 ]]; then
-                    printf '%s' "$row" | jq -r ".${field} // empty"
-                else
-                    # Check if there's a blob ref for this field and we want full.
-                    printf '%s' "$row" | jq -r ".${field} // empty"
-                fi
-                ;;
-            *) die "show: unknown field: $field (expected stdout|stderr|cmd|thought)" ;;
-        esac
+        printf '%s' "$row" | jq -r ".${field} // empty"
         return
     fi
 
@@ -239,15 +295,16 @@ cmd_show() {
 # ---------------------------------------------------------------------------
 
 cmd_tail() {
-    local run_dir="" n=10 follow=0
+    local traj_dir="" n=10 follow=0 branch="root"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n) n="${2:?-n requires a number}"; shift 2 ;;
-            -f) follow=1; shift ;;
-            -*) die "tail: unknown option: $1" ;;
+            -n)       n="${2:?-n requires a number}"; shift 2 ;;
+            -f)       follow=1; shift ;;
+            --branch) branch="${2:?--branch requires NAME}"; shift 2 ;;
+            -*)       die "tail: unknown option: $1" ;;
             *)
-                if [[ -z "$run_dir" ]]; then
-                    run_dir="$1"
+                if [[ -z "$traj_dir" ]]; then
+                    traj_dir="$1"
                 else
                     die "tail: unexpected argument: $1"
                 fi
@@ -255,17 +312,17 @@ cmd_tail() {
                 ;;
         esac
     done
-    [[ -n "$run_dir" ]] || die "tail requires <run_dir>"
+    [[ -n "$traj_dir" ]] || die "tail requires <traj_dir>"
 
-    local traj_file="$run_dir/.shellm/$TRAJ_FILE"
-    [[ -f "$traj_file" ]] || die "tail: trajectory not found: $traj_file"
+    local branch_file
+    branch_file=$(require_branch_file "$traj_dir" "$branch" "tail")
 
     if [[ "$follow" -eq 1 ]]; then
-        tail -n "$n" -f "$traj_file" | while IFS= read -r line; do
+        tail -n "$n" -f "$branch_file" | while IFS= read -r line; do
             printf '%s\n' "$line" | jq -c . 2>/dev/null || printf '%s\n' "$line"
         done
     else
-        tail -n "$n" "$traj_file"
+        tail -n "$n" "$branch_file"
     fi
 }
 
@@ -274,17 +331,18 @@ cmd_tail() {
 # ---------------------------------------------------------------------------
 
 cmd_search() {
-    local run_dir="" pattern="" field="all" case_flag="" context_lines=0 use_regex=0
+    local traj_dir="" pattern="" field="all" case_flag="" context_lines=0 use_regex=0 branch="root"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --field) field="${2:?--field requires a value}"; shift 2 ;;
-            -i)      case_flag="-i"; shift ;;
-            -C)      context_lines="${2:?-C requires a number}"; shift 2 ;;
-            -E)      use_regex=1; shift ;;
-            -*)      die "search: unknown option: $1" ;;
+            --field)  field="${2:?--field requires a value}"; shift 2 ;;
+            --branch) branch="${2:?--branch requires NAME}"; shift 2 ;;
+            -i)       case_flag="-i"; shift ;;
+            -C)       context_lines="${2:?-C requires a number}"; shift 2 ;;
+            -E)       use_regex=1; shift ;;
+            -*)       die "search: unknown option: $1" ;;
             *)
-                if [[ -z "$run_dir" ]]; then
-                    run_dir="$1"
+                if [[ -z "$traj_dir" ]]; then
+                    traj_dir="$1"
                 elif [[ -z "$pattern" ]]; then
                     pattern="$1"
                 else
@@ -294,18 +352,17 @@ cmd_search() {
                 ;;
         esac
     done
-    [[ -n "$run_dir" ]] || die "search requires <run_dir>"
+    [[ -n "$traj_dir" ]] || die "search requires <traj_dir>"
     [[ -n "$pattern" ]] || die "search requires <pattern>"
 
-    local shellm_dir="$run_dir/.shellm"
-    local traj_file="$shellm_dir/$TRAJ_FILE"
-    [[ -f "$traj_file" ]] || die "search: trajectory not found: $traj_file"
+    local branch_file
+    branch_file=$(require_branch_file "$traj_dir" "$branch" "search")
 
+    # Search all non-metadata fields by default, or specific field.
     local fields_to_search
     case "$field" in
-        all) fields_to_search="thought cmd stdout stderr" ;;
-        thought|cmd|stdout|stderr) fields_to_search="$field" ;;
-        *) die "search: unknown field: $field" ;;
+        all) fields_to_search="content thought cmd stdout stderr" ;;
+        *)   fields_to_search="$field" ;;
     esac
 
     local grep_mode="-F"  # literal by default
@@ -315,6 +372,8 @@ cmd_search() {
     [[ -n "$case_flag" ]] && grep_args+=($case_flag)
     [[ "$context_lines" -gt 0 ]] && grep_args+=(-C "$context_lines")
     grep_args+=(-n)  # line numbers
+
+    local blob_dir="$traj_dir/blobs"
 
     # Iterate over each row in the trajectory.
     while IFS= read -r row; do
@@ -330,8 +389,8 @@ cmd_search() {
             local ref_val
             ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
 
-            if [[ -n "$ref_val" ]] && [[ -f "$shellm_dir/$ref_val" ]]; then
-                content=$(cat "$shellm_dir/$ref_val")
+            if [[ -n "$ref_val" ]] && [[ -f "$traj_dir/$ref_val" ]]; then
+                content=$(cat "$traj_dir/$ref_val")
             else
                 content=$(printf '%s' "$row" | jq -r ".${f} // empty")
             fi
@@ -348,7 +407,31 @@ cmd_search() {
                 printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
             done <<< "$matches"
         done
-    done < "$traj_file"
+    done < "$branch_file"
+}
+
+# ---------------------------------------------------------------------------
+# branches
+# ---------------------------------------------------------------------------
+
+cmd_branches() {
+    local traj_dir="${1:?branches requires <traj_dir>}"
+
+    [[ -d "$traj_dir" ]] || die "branches: directory not found: $traj_dir"
+
+    # List all .jsonl files, mapping trajectory.jsonl → root for compat.
+    # Use a delimited string to deduplicate (bash 3.2 compat).
+    local _seen="" f name
+    for f in "$traj_dir"/*.jsonl; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .jsonl)
+        [[ "$name" == "trajectory" ]] && name="root"
+        case "$_seen" in
+            *"|${name}|"*) continue ;;
+        esac
+        _seen="${_seen}|${name}|"
+        printf '%s\n' "$name"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -358,10 +441,11 @@ cmd_search() {
 [[ $# -gt 0 ]] || usage 1
 cmd="$1"; shift
 case "$cmd" in
-    append) cmd_append "$@" ;;
-    show)   cmd_show "$@" ;;
-    tail)   cmd_tail "$@" ;;
-    search) cmd_search "$@" ;;
+    append)   cmd_append "$@" ;;
+    show)     cmd_show "$@" ;;
+    tail)     cmd_tail "$@" ;;
+    search)   cmd_search "$@" ;;
+    branches) cmd_branches "$@" ;;
     help|-h|--help) usage 0 ;;
     *) die "unknown command: $cmd" ;;
 esac
