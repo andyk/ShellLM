@@ -1170,9 +1170,10 @@ extract_code() {
     truncation_signal=$(cat "$truncation_file" 2>/dev/null || true)
     rm -f "$truncation_file"
 
-    # If no fenced blocks at all, use the whole response as code
+    # If no fenced blocks at all, use the whole response as code.
+    # Strip [cmd]/[thought] markers that the model may emit instead of fences.
     if [[ -z "$code" ]]; then
-        code="$response"
+        code=$(printf '%s\n' "$response" | sed '/^[[:space:]]*\[cmd\][[:space:]]*$/d; /^[[:space:]]*\[thought\]/d')
     fi
 
     # If the model emitted extra blocks past the first, prepend a notice
