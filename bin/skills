@@ -455,6 +455,7 @@ action_list() {
     local format="${2:-}"
     local found=0
     local dir label skill_dir name desc
+    local skipped=""
     # Track seen skill names for conflict detection (pipe-delimited for bash 3.2 compat)
     local _seen_skills="|"
     local _seen_paths=""
@@ -493,8 +494,12 @@ action_list() {
                 missing=$(_missing_summary "$meta")
             fi
 
-            # Filter unless --all
-            if [[ "$eligible" -eq 0 && "$show_all" -eq 0 ]]; then
+            if [[ "$eligible" -eq 0 ]]; then
+                if [[ "$format" != "prompt" ]]; then
+                    [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+                    skipped+="$(printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset} ${_yellow}(missing: %s)${_reset}\n    ${_dim}%s${_reset}\n" \
+                        "$name" "${_dim}${desc}" "$label" "$missing" "$skill_path")"
+                fi
                 continue
             fi
 
@@ -504,14 +509,8 @@ action_list() {
                 printf -- '- %s: %s\n' "$name" "$desc"
             else
                 [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
-
-                if [[ "$eligible" -eq 0 ]]; then
-                    printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset} ${_yellow}(missing: %s)${_reset}\n    ${_dim}%s${_reset}\n" \
-                        "$name" "${_dim}${desc}" "$label" "$missing" "$skill_path"
-                else
-                    printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
-                        "$name" "${_dim}${desc}" "$label" "$skill_path"
-                fi
+                printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
+                    "$name" "${_dim}${desc}" "$label" "$skill_path"
             fi
         done
     done < <(_all_skill_dirs)
@@ -546,6 +545,12 @@ action_list() {
             done < <(_all_remote_skills)
 
             [[ "$remote_found" -eq 0 ]] && printf "  ${_dim}(none)${_reset}\n"
+        fi
+
+        # --- Skipped (missing requirements) ---
+        if [[ -n "$skipped" ]]; then
+            printf "\n${_bold}Skipped (missing requirements)${_reset}\n"
+            printf '%b' "$skipped"
         fi
     fi
 }

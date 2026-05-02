@@ -121,6 +121,13 @@ ensure_persona() {
     SHELLY_KERNEL_DIR="$persona_dir/kernel"
     SHELLY_TRAJ_DIR="$persona_dir/traj"
     mkdir -p "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR" "$SHELLY_KERNEL_DIR" "$SHELLY_TRAJ_DIR"
+
+    # Seed core-skills remote if not already configured
+    local core_skills="$HOME/.skills/core-skills"
+    if [[ -d "$core_skills" && ! -f "$SHELLY_SKILLS_DIR/.skillsrc" ]]; then
+        printf 'SKILLS_REMOTES="%s"\n' "$core_skills" > "$SHELLY_SKILLS_DIR/.skillsrc"
+    fi
+
     ensure_kernel
 }
 
@@ -599,6 +606,12 @@ cmd_new() {
     # Create per-persona dirs (traj replaces history.jsonl)
     mkdir -p "$persona_dir/memories" "$persona_dir/skills" "$persona_dir/kernel" "$persona_dir/traj"
 
+    # Seed core-skills remote if installed
+    local core_skills="$HOME/.skills/core-skills"
+    if [[ -d "$core_skills" ]]; then
+        printf 'SKILLS_REMOTES="%s"\n' "$core_skills" > "$persona_dir/skills/.skillsrc"
+    fi
+
     # Bootstrap kernel (mem SKILL.md)
     SHELLY_KERNEL_DIR="$persona_dir/kernel"
     ensure_kernel
@@ -743,6 +756,7 @@ cmd_switch() {
     # Try exact match first
     if [[ -d "$personas_dir/$target" ]]; then
         ln -sfn "$target" "$SHELLY_DIR/personas/current"
+        ensure_persona
         printf 'Switched to: %s\n' "$target" >&2
         return
     fi
@@ -755,6 +769,7 @@ cmd_switch() {
 
     if [[ "$count" -eq 1 ]]; then
         ln -sfn "$matches" "$SHELLY_DIR/personas/current"
+        ensure_persona
         printf 'Switched to: %s\n' "$matches" >&2
     elif [[ "$count" -gt 1 ]]; then
         die "Ambiguous: '$target' matches multiple personas:

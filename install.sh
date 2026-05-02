@@ -49,6 +49,21 @@ for tool in "${TOOLS[@]}"; do
     fi
 done
 
+# Install bundled skills to ~/.skills/core-skills
+SKILLS_PREFIX="${HOME}/.skills/core-skills"
+mkdir -p "$SKILLS_PREFIX"
+for skill_dir in skills/*/; do
+    [[ -f "${skill_dir}SKILL.md" ]] || continue
+    name=$(basename "$skill_dir")
+    if [[ "$SYMLINKS" -eq 1 ]]; then
+        ln -sfn "$(pwd)/$skill_dir" "$SKILLS_PREFIX/$name"
+    else
+        rm -rf "$SKILLS_PREFIX/$name"
+        cp -R "$skill_dir" "$SKILLS_PREFIX/$name"
+    fi
+done
+echo "Installed core skills → $SKILLS_PREFIX"
+
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)
