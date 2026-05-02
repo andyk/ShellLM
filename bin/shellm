@@ -1217,6 +1217,7 @@ IMPORTANT: End your response with exactly ONE ```bash code block. Your response 
 - You have all the standard tools available on Linux/Unix based systems
 - Standard shell: cd, ls, grep, cat, rm, cp, mv, mkdir, echo, curl, find, etc.
 - Text processing: grep, awk, sed, wc, sort, uniq, head, tail, cut, tr, jq, etc.
+- File tools: view (read with line numbers), sub (exact-string edit), put (atomic write), glob (git-aware file search)
 - Recursive self-calling: you can recursively make shellm sub-calls
 
 ## Trajectory and context

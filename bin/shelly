@@ -17,6 +17,14 @@ SHELLY_KERNEL_DIR=""
 SHELLY_TRAJ_DIR=""
 VERBOSE=0
 
+# Load .env if present (so skill-declared vars like OBSIDIAN_VAULT are available)
+if [[ -f ".env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 # Source per-repo rc file (flags > env vars > rc file)
 if [[ -f ".shellyrc" ]]; then
     _pre_env=$(env | grep '^SHELLY_') || true
@@ -40,6 +48,37 @@ debug() {
 
 iso_timestamp() {
     date +%Y-%m-%dT%H:%M:%S
+}
+
+# Collect vars declared by skills in SKILL.md frontmatter.
+# Scans kernel skills and persona skills for `vars:` lists.
+# Outputs deduplicated var names, one per line.
+collect_skill_vars() {
+    local persona_dir="$1"
+    local -a var_names=()
+    local -a dirs=("$SHELLY_KERNEL_DIR" "$persona_dir/skills")
+    local base skill_dir
+    for base in "${dirs[@]}"; do
+        [[ -d "$base" ]] || continue
+        for skill_dir in "$base"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            local in_vars=0
+            while IFS= read -r line; do
+                if [[ "$in_vars" -eq 1 ]]; then
+                    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+([A-Za-z_][A-Za-z_0-9]*) ]]; then
+                        var_names+=("${BASH_REMATCH[1]}")
+                    else
+                        in_vars=0
+                    fi
+                fi
+                [[ "$line" == "vars:" ]] && in_vars=1
+            done < <(sed -n '/^---$/,/^---$/p' "${skill_dir}SKILL.md")
+        done
+    done
+    # Deduplicate and output
+    if [[ ${#var_names[@]} -gt 0 ]]; then
+        printf '%s\n' "${var_names[@]}" | sort -u
+    fi
 }
 
 json_escape() {
@@ -278,6 +317,14 @@ cmd_send() {
     local persona_name
     persona_name=$(basename "$(readlink "$SHELLY_DIR/personas/current")")
 
+    # Collect --var flags from skill-declared vars
+    local -a skill_var_flags=()
+    while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        local vval="${!vname:-}"
+        [[ -n "$vval" ]] && skill_var_flags+=(--var "$vname=$vval")
+    done < <(collect_skill_vars "$persona_dir")
+
     # Build the prompt for shellm: system context + conversation history + current message.
     # shellm is unaware of shelly — it just receives this as its prompt string.
     # Prior conversation turns come from shelly's persistent trajectory via context.
@@ -312,6 +359,7 @@ $chat_history
         --var "MEM_DIR=$abs_mem_dir" \
         --var "SKILLS_DIR=$abs_skills_dir" \
         --var "SKILLS_KERNEL_DIR=$abs_kernel_dir" \
+        ${skill_var_flags[@]+"${skill_var_flags[@]}"} \
         --bin "$(command -v mem)" \
         --bin "$(command -v skills)" \
         "$full_message" > "$response_file" &
@@ -823,6 +871,9 @@ cmd_whoami() {
     persona_name=$(grep '^name=' "$persona_dir/info.txt" 2>/dev/null | cut -d= -f2-) || true
     [[ -z "$persona_name" ]] && persona_name=$(basename "$persona_dir")
     printf '%s\n' "$persona_name"
+    if [[ "${1:-}" == "-a" ]]; then
+        printf '%s\n' "$persona_dir"
+    fi
 }
 
 cmd_context() {
@@ -843,7 +894,7 @@ Usage:
   shelly history               Show conversation history
   shelly reset                 Reset current persona
   shelly compact               Summarize and compact history
-  shelly whoami                Print current persona name
+  shelly whoami [-a]           Print current persona name (-a: also print persona dir)
   shelly context               Show assembled system prompt
 
 Personas:
@@ -965,7 +1016,7 @@ main() {
             cmd_compact
             ;;
         whoami)
-            cmd_whoami
+            cmd_whoami "$@"
             ;;
         context)
             cmd_context
