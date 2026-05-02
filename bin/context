@@ -296,8 +296,14 @@ render_step() {
         if [[ "$num_content" -eq 1 ]]; then
             # Single content key: just the value.
             output="$val"
+        elif [[ "$k" == "cmd" ]]; then
+            # Render commands as fenced code blocks so the model sees
+            # its own output format in history, not [cmd] markers.
+            output+='```bash'$'\n'"${val}"$'\n```\n\n'
+        elif [[ "$k" == "thought" ]]; then
+            output+="${val}"$'\n\n'
         else
-            # Multiple keys: use [key] wrappers.
+            # Generic fallback for other multi-key steps.
             output+="[${k}]"$'\n'"${val}"$'\n\n'
         fi
     done
