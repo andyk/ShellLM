@@ -47,6 +47,21 @@ SHELLY_PERSONA = (
     "```\n"
 )
 
+
+def _load_skills(repo_dir: Path) -> str:
+    """Read SKILL.md files from the repo's .skills/ directory."""
+    skills_dir = repo_dir / ".skills"
+    if not skills_dir.is_dir():
+        return ""
+    sections = []
+    for skill_dir in sorted(skills_dir.iterdir()):
+        skill_md = skill_dir / "SKILL.md"
+        if skill_md.is_file():
+            sections.append(f"### Skill: {skill_dir.name}\n{skill_md.read_text()}")
+    if not sections:
+        return ""
+    return "## Installed skills\n\n" + "\n\n".join(sections) + "\n\n"
+
 PROMPT_PREAMBLE = (
     SHELLY_PERSONA + "\n"
     "## Evaluation context\n"
@@ -97,6 +112,8 @@ class ShellyAgent(BaseAgent):
         self.docker_access = docker_access
         self.inactivity_timeout = int(inactivity_timeout)
         self.host_bin_dir = self._find_bin_dir()
+        self.host_repo_dir = self.host_bin_dir.parent
+        self.skills_text = _load_skills(self.host_repo_dir)
 
     @staticmethod
     def name() -> str:
@@ -200,6 +217,21 @@ docker version --format '{{.Client.Version}}' >/dev/null
             user="root",
         )
 
+        # Upload skills so mem/skills tools work at runtime
+        skills_dir = self.host_repo_dir / ".skills"
+        if skills_dir.is_dir():
+            for skill_dir in skills_dir.iterdir():
+                skill_md = skill_dir / "SKILL.md"
+                if skill_md.is_file():
+                    await environment.exec(
+                        command=f"mkdir -p /app/.skills/{skill_dir.name}",
+                        user="root",
+                    )
+                    await environment.upload_file(
+                        source_path=skill_md,
+                        target_path=f"/app/.skills/{skill_dir.name}/SKILL.md",
+                    )
+
         # Sanity check
         await environment.exec(
             command=(
@@ -223,8 +255,7 @@ docker version --format '{{.Client.Version}}' >/dev/null
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        prompt = PROMPT_PREAMBLE + instruction
-        escaped_prompt = shlex.quote(prompt)
+        prompt = PROMPT_PREAMBLE + self.skills_text + instruction
 
         # Strip provider prefix from model name
         mn = ""
