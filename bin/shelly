@@ -85,6 +85,20 @@ json_escape() {
     printf '%s' "$1" | jq -Rsa .
 }
 
+# Kill Docker containers managed by a persona's shellm envs.
+_destroy_persona_containers() {
+    local persona_dir="$1"
+    local envs_dir="$persona_dir/.shellm/envs"
+    [[ -d "$envs_dir" ]] || return 0
+    local env_dir
+    for env_dir in "$envs_dir"/*/; do
+        [[ -f "$env_dir/container_id" ]] || continue
+        local cid
+        cid=$(cat "$env_dir/container_id" 2>/dev/null || true)
+        [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Persona management
 # ---------------------------------------------------------------------------
@@ -296,7 +310,7 @@ cmd_send() {
         --exclude-types agent-run 2>/dev/null) || messages='[]'
 
     # Run shellm in background so Ctrl+C can interrupt it
-    local run_dir="$persona_dir/run"
+    local run_dir="$persona_dir/workdir"
     local response_file
     response_file=$(mktemp)
     local _interrupted=0
@@ -346,6 +360,8 @@ $chat_history
 "
     fi
     full_message+="$message"
+
+    export SHELLM_HOME="$persona_dir/.shellm"
 
     SHELLM_NO_BANNER=1 SHELLM_MODEL="$SHELLY_MODEL" \
         shellm --env "$persona_name" --workdir "$run_dir" \
@@ -467,11 +483,14 @@ cmd_repl() {
                             cmd_delete "$personas_arg"
                         fi
                         ;;
+                    info)
+                        cmd_persona_info
+                        ;;
                     list)
-                        cmd_personas
+                        cmd_personas $personas_arg
                         ;;
                     *)
-                        printf 'Unknown: /personas %s (try: new, list, switch, delete)\n' "$personas_sub" >&2
+                        printf 'Unknown: /personas %s (try: new, list, switch, delete, info)\n' "$personas_sub" >&2
                         ;;
                 esac
                 ;;
@@ -484,11 +503,15 @@ cmd_repl() {
             /reset)
                 cmd_reset
                 ;;
-            /compact)
-                cmd_compact
-                ;;
             /context)
                 cmd_context
+                ;;
+            /envs\ *)
+                local envs_args="${input#/envs }"
+                eval cmd_envs $envs_args
+                ;;
+            /envs)
+                cmd_envs
                 ;;
             /mem\ *)
                 local mem_args="${input#/mem }"
@@ -522,12 +545,15 @@ repl_help() {
 Slash commands:
   /history        Show conversation history
   /reset          Reset current persona
-  /compact        Summarize and compact history
   /context        Show assembled system prompt
   /personas              List all personas
+  /personas list [-a]    List all personas (-a: show directories)
+  /personas info         Show detailed info about current persona
   /personas new <name>   Create a new persona
   /personas switch <name> Switch to a persona (prefix match)
   /personas delete <name> Delete a persona
+  /envs               List Docker envs for current persona
+  /envs rm <name>     Destroy a specific env
   /mem add <text>       Add a memory
   /mem search <query>   Search memories
   /mem list             List memories (dates + slugs)
@@ -589,6 +615,14 @@ cmd_new() {
 }
 
 cmd_personas() {
+    local show_dir=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all) show_dir=1; shift ;;
+            *) break ;;
+        esac
+    done
+
     local personas_dir="$SHELLY_DIR/personas"
     if [[ ! -d "$personas_dir" ]]; then
         echo "No personas." >&2
@@ -623,8 +657,80 @@ cmd_personas() {
             [[ -z "$created" ]] && created=$(grep '^started=' "$info" 2>/dev/null | cut -d= -f2-) || true
         fi
 
-        printf '%s %-20s %s\n' "$marker" "$d" "$created"
+        if [[ "$show_dir" -eq 1 ]]; then
+            local abs_dir
+            abs_dir=$(cd "$personas_dir/$d" 2>/dev/null && pwd) || abs_dir="$personas_dir/$d"
+            printf '%s %-20s %s  %s\n' "$marker" "$d" "$created" "$abs_dir"
+        else
+            printf '%s %-20s %s\n' "$marker" "$d" "$created"
+        fi
     done <<< "$dirs"
+}
+
+cmd_persona_info() {
+    ensure_persona
+    local persona_dir
+    persona_dir=$(resolve_persona)
+
+    local persona_name
+    persona_name=$(grep '^name=' "$persona_dir/info.txt" 2>/dev/null | cut -d= -f2-) || true
+    [[ -z "$persona_name" ]] && persona_name=$(basename "$persona_dir")
+
+    local created
+    created=$(grep '^created=' "$persona_dir/info.txt" 2>/dev/null | cut -d= -f2-) || true
+    [[ -z "$created" ]] && created=$(grep '^started=' "$persona_dir/info.txt" 2>/dev/null | cut -d= -f2-) || true
+
+    local cwd
+    cwd=$(grep '^cwd=' "$persona_dir/info.txt" 2>/dev/null | cut -d= -f2-) || true
+
+    printf 'Name:     %s\n' "$persona_name"
+    printf 'Created:  %s\n' "${created:-(unknown)}"
+    printf 'Dir:      %s\n' "$persona_dir"
+    [[ -n "$cwd" ]] && printf 'Cwd:      %s\n' "$cwd"
+
+    # Kernel skills
+    local kernel_count=0
+    local kernel_names=""
+    if [[ -d "$persona_dir/kernel" ]]; then
+        local skill_dir
+        for skill_dir in "$persona_dir/kernel"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            kernel_count=$((kernel_count + 1))
+            local sname
+            sname=$(basename "$skill_dir")
+            kernel_names="${kernel_names}${kernel_names:+, }${sname}"
+        done
+    fi
+    printf 'Kernel:   %d (%s)\n' "$kernel_count" "${kernel_names:--}"
+
+    # Installed skills
+    local skills_count=0
+    local skills_names=""
+    if [[ -d "$persona_dir/skills" ]]; then
+        local skill_dir
+        for skill_dir in "$persona_dir/skills"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            skills_count=$((skills_count + 1))
+            local sname
+            sname=$(basename "$skill_dir")
+            skills_names="${skills_names}${skills_names:+, }${sname}"
+        done
+    fi
+    printf 'Skills:   %d (%s)\n' "$skills_count" "${skills_names:--}"
+
+    # Memory count
+    local mem_count=0
+    if [[ -d "$persona_dir/memories" ]]; then
+        mem_count=$(find "$persona_dir/memories" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    printf 'Memories: %d\n' "$mem_count"
+
+    # Traj turns
+    local traj_count=0
+    if [[ -f "$persona_dir/traj/root.jsonl" ]]; then
+        traj_count=$(wc -l < "$persona_dir/traj/root.jsonl" | tr -d ' ')
+    fi
+    printf 'History:  %d turns\n' "$traj_count"
 }
 
 cmd_switch() {
@@ -674,16 +780,8 @@ cmd_delete() {
         die "Cannot delete the active persona. Switch to another first."
     fi
 
-    # Destroy the Docker workspace if it exists
-    local ws_dir="$HOME/.shellm/workspaces/$target"
-    if [[ -d "$ws_dir" ]]; then
-        if [[ -f "$ws_dir/container_id" ]]; then
-            local cid
-            cid=$(cat "$ws_dir/container_id" 2>/dev/null || true)
-            [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$ws_dir"
-    fi
+    # Destroy Docker containers for this persona
+    _destroy_persona_containers "$personas_dir/$target"
 
     rm -rf "$personas_dir/$target"
     printf 'Deleted persona: %s\n' "$target" >&2
@@ -751,16 +849,9 @@ cmd_reset() {
     local persona_name
     persona_name=$(basename "$persona_dir")
 
-    # Destroy the Docker workspace for this persona
-    local ws_dir="$HOME/.shellm/workspaces/$persona_name"
-    if [[ -d "$ws_dir" ]]; then
-        if [[ -f "$ws_dir/container_id" ]]; then
-            local cid
-            cid=$(cat "$ws_dir/container_id" 2>/dev/null || true)
-            [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$ws_dir"
-    fi
+    # Destroy Docker containers and shellm state for this persona
+    _destroy_persona_containers "$persona_dir"
+    rm -rf "$persona_dir/.shellm"
 
     # Clear traj directory
     rm -rf "$persona_dir/traj"
@@ -770,90 +861,67 @@ cmd_reset() {
     rm -f "$persona_dir/history.jsonl"
 
     # Remove shellm workdir
-    rm -rf "$persona_dir/run"
+    rm -rf "$persona_dir/workdir"
 
     debug "Cleared persona: $persona_dir"
     printf 'Persona reset: %s\n' "$persona_name" >&2
 }
 
-cmd_compact() {
+cmd_envs() {
     ensure_persona
     local persona_dir
     persona_dir=$(resolve_persona)
-    local traj_dir="$persona_dir/traj"
+    local envs_dir="$persona_dir/.shellm/envs"
+    local sub="${1:-list}"
+    [[ -n "${1:-}" ]] && shift
 
-    local traj_file
-    traj_file=$(traj_resolve_file "$traj_dir")
-
-    if [[ -z "$traj_file" ]]; then
-        echo "Nothing to compact." >&2
-        return
-    fi
-
-    # Build conversation text from traj (or legacy history)
-    local conversation=""
-    while IFS= read -r line; do
-        local step_type content role
-        step_type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
-
-        if [[ -n "$step_type" ]]; then
-            content=$(printf '%s' "$line" | jq -r '.content // empty')
-            case "$step_type" in
-                human-msg)  conversation="${conversation}User: ${content}
-" ;;
-                agent-msg)  conversation="${conversation}Assistant: ${content}
-" ;;
-            esac
-        else
-            role=$(printf '%s' "$line" | jq -r '.role // ""')
-            content=$(printf '%s' "$line" | jq -r '.content // ""')
-            if [[ "$role" == "user" ]]; then
-                conversation="${conversation}User: ${content}
-"
-            elif [[ "$role" == "assistant" ]]; then
-                conversation="${conversation}Assistant: ${content}
-"
+    case "$sub" in
+        list)
+            if [[ ! -d "$envs_dir" ]] || [[ -z "$(ls -A "$envs_dir" 2>/dev/null)" ]]; then
+                printf 'No envs for this persona.\n' >&2
+                return
             fi
-        fi
-    done < "$traj_file"
-
-    # Summarize using llm
-    printf 'Compacting history...\n' >&2
-    local summary
-    summary=$(llm -m "$SHELLY_MODEL" \
-        -s "You produce concise conversation summaries. Capture key facts, decisions, and context." \
-        "Summarize this conversation concisely. Output a brief summary paragraph.
-
-${conversation}") || {
-        die "Failed to compact history"
-    }
-
-    # Replace traj with compacted summary
-    rm -rf "$traj_dir"
-    mkdir -p "$traj_dir"
-    printf '{"type":"agent-msg","content":%s}' "$(printf '%s' "[Compacted] $summary" | jq -Rsa .)" \
-        | traj append "$traj_dir" >/dev/null
-
-    # Also remove legacy history if present
-    rm -f "$persona_dir/history.jsonl"
-
-    # Destroy the Docker workspace for this persona
-    local persona_name
-    persona_name=$(basename "$persona_dir")
-    local ws_dir="$HOME/.shellm/workspaces/$persona_name"
-    if [[ -d "$ws_dir" ]]; then
-        if [[ -f "$ws_dir/container_id" ]]; then
-            local cid
-            cid=$(cat "$ws_dir/container_id" 2>/dev/null || true)
-            [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$ws_dir"
-    fi
-
-    # Remove old shellm workdir (will be recreated on next send)
-    rm -rf "$persona_dir/run"
-
-    printf 'History compacted.\n' >&2
+            local env_dir
+            for env_dir in "$envs_dir"/*/; do
+                [[ -d "$env_dir" ]] || continue
+                local name created status
+                name=$(basename "$env_dir")
+                created=""
+                [[ -f "$env_dir/created" ]] && created=$(cat "$env_dir/created" 2>/dev/null || true)
+                status="gone"
+                if [[ -f "$env_dir/container_id" ]]; then
+                    local cid
+                    cid=$(cat "$env_dir/container_id" 2>/dev/null || true)
+                    if [[ -n "$cid" ]]; then
+                        local state
+                        state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || true)
+                        if [[ "$state" == "running" ]]; then
+                            status="running"
+                        elif [[ -n "$state" ]]; then
+                            status="stopped"
+                        fi
+                    fi
+                fi
+                printf '%-30s  %-10s  %s\n' "$name" "$status" "$created"
+            done
+            ;;
+        rm)
+            local name="${1:-}"
+            [[ -z "$name" ]] && die "Usage: shelly envs rm <name>"
+            local target_dir="$envs_dir/$name"
+            [[ -d "$target_dir" ]] || die "No env named: $name"
+            if [[ -f "$target_dir/container_id" ]]; then
+                local cid
+                cid=$(cat "$target_dir/container_id" 2>/dev/null || true)
+                [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$target_dir"
+            printf 'Removed env: %s\n' "$name" >&2
+            ;;
+        *)
+            die "Unknown envs subcommand: $sub (try: list, rm)"
+            ;;
+    esac
 }
 
 cmd_whoami() {
@@ -886,12 +954,17 @@ Usage:
   shelly repl                  Start interactive REPL
   shelly history               Show conversation history
   shelly reset                 Reset current persona
-  shelly compact               Summarize and compact history
   shelly whoami [-a]           Print current persona name (-a: also print persona dir)
   shelly context               Show assembled system prompt
 
+Docker Envs:
+  shelly envs                  List Docker envs for current persona
+  shelly envs rm <name>        Destroy a specific env
+
 Personas:
   shelly personas              List all personas
+  shelly personas list [-a]    List all personas (-a: show directories)
+  shelly personas info         Show detailed info about current persona
   shelly personas new <name>   Create a new persona
   shelly personas switch <name> Switch to a persona (prefix match)
   shelly personas delete <name> Delete a persona
@@ -991,11 +1064,17 @@ main() {
                     [[ $# -eq 0 ]] && die "Usage: shelly personas delete <name>"
                     cmd_delete "$1"
                     ;;
+                info)
+                    cmd_persona_info
+                    ;;
                 list|"")
-                    cmd_personas
+                    cmd_personas "$@"
+                    ;;
+                -a|--all)
+                    cmd_personas "$sub" "$@"
                     ;;
                 *)
-                    die "Unknown personas subcommand: $sub (try: new, list, switch, delete)"
+                    die "Unknown personas subcommand: $sub (try: new, list, switch, delete, info)"
                     ;;
             esac
             ;;
@@ -1005,14 +1084,14 @@ main() {
         reset)
             cmd_reset
             ;;
-        compact)
-            cmd_compact
-            ;;
         whoami)
             cmd_whoami "$@"
             ;;
         context)
             cmd_context
+            ;;
+        envs)
+            cmd_envs "$@"
             ;;
         mem)
             MEM_DIR="$SHELLY_MEMORIES_DIR" mem "$@"

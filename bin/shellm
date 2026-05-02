@@ -18,7 +18,8 @@ _shellm_load_env() {
     return 1
 }
 _SHELLM_SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]:-$0}")
-_shellm_load_env ".env" || _shellm_load_env "$HOME/.shellm/.env" || true
+SHELLM_HOME="${SHELLM_HOME:-$HOME/.shellm}"
+_shellm_load_env ".env" || _shellm_load_env "$SHELLM_HOME/.env" || true
 
 # ---------------------------------------------------------------------------
 # Config & defaults
@@ -462,7 +463,7 @@ docker_broker_start() {
     broker_path=$(resolve_shellm_tool_path "$shellm_path" "shellm-docker-broker" || true)
     [[ -x "$broker_path" ]] || die "Broker mode requires shellm-docker-broker next to shellm or on PATH"
 
-    local broker_dir="$HOME/.shellm/docker-broker/$env_name"
+    local broker_dir="$SHELLM_HOME/docker-broker/$env_name"
     local env_dir="$SHELLM_ENVS_DIR/$env_name"
     mkdir -p "$broker_dir" "$env_dir"
 
@@ -593,8 +594,8 @@ env_metadata_mismatch_message() {
         local stored_tool_mounts_version
         stored_tool_mounts_version=$(docker_metadata_value "$env_name" tool_mounts_version)
         if [[ "$stored_tool_mounts_version" != "$_SHELLM_TOOL_MOUNTS_VERSION" ]]; then
-            printf 'Env %s was created before current shellm tool mounts. Use a different --env or remove ~/.shellm/envs/%s so shellm can recreate it with llm, shellm-explore, and sibling tools mounted.' \
-                "$env_name" "$env_name"
+            printf 'Env %s was created before current shellm tool mounts. Use a different --env or remove %s/envs/%s so shellm can recreate it with llm, shellm-explore, and sibling tools mounted.' \
+                "$env_name" "$SHELLM_HOME" "$env_name"
             return
         fi
     fi
@@ -606,8 +607,8 @@ env_metadata_mismatch_message() {
     _expected_var_mounts="${_expected_var_mounts%%$'\n'}"
     _stored_var_mounts="${_stored_var_mounts%%$'\n'}"
     if [[ "$_expected_var_mounts" != "$_stored_var_mounts" ]]; then
-        printf 'Env %s has different --var directory mounts than this run requires. Use a different --env or remove ~/.shellm/envs/%s so shellm can recreate it with the correct mounts.' \
-            "$env_name" "$env_name"
+        printf 'Env %s has different --var directory mounts than this run requires. Use a different --env or remove %s/envs/%s so shellm can recreate it with the correct mounts.' \
+            "$env_name" "$SHELLM_HOME" "$env_name"
         return
     fi
     printf 'Env %s was created with docker_access=%s, but this run requested docker_access=%s. Use a different --env, destroy the env, or request the same access mode.' \
@@ -651,7 +652,7 @@ docker_setup() {
 
     # Mount the runs dir (parent of the default workspace) so containers can be
     # reused across runs without needing new bind mounts.
-    local runs_mount="$HOME/.shellm"
+    local runs_mount="$SHELLM_HOME"
     mkdir -p "$runs_mount"
 
     local -a docker_run_flags=(
@@ -861,7 +862,7 @@ docker_attach() {
 # Env management
 # ---------------------------------------------------------------------------
 
-SHELLM_ENVS_DIR="$HOME/.shellm/envs"
+SHELLM_ENVS_DIR="$SHELLM_HOME/envs"
 
 # Create or reattach to a named env.
 # Sets _SHELLM_CONTAINER and _SHELLM_DOCKER_MODE if docker type.
@@ -883,7 +884,7 @@ env_resolve() {
         container_id=$(cat "$ws_dir/container_id")
         if [[ -n "$container_id" ]] && docker_container_has_unusable_tool_mounts "$container_id"; then
             if [[ "$explicit" -eq 1 ]]; then
-                die "Env $name has stale or unusable shellm tool mounts. Use a different --env or remove ~/.shellm/envs/$name so shellm can recreate it."
+                die "Env $name has stale or unusable shellm tool mounts. Use a different --env or remove $SHELLM_HOME/envs/$name so shellm can recreate it."
             fi
             progress "Skipping env $name because its shellm tool mounts are stale"
             return 1
@@ -1517,7 +1518,7 @@ run_loop() {
         # Sub-run: nest inside parent run record (direct child)
         rundir="${_SHELLM_PARENT_RUNDIR}/$run_name"
     else
-        rundir="$HOME/.shellm/runs/$run_name"
+        rundir="$SHELLM_HOME/runs/$run_name"
     fi
     mkdir -p "$rundir/.shellm/traj"
 
@@ -1532,7 +1533,7 @@ run_loop() {
     if [[ -n "$_SHELLM_WORKDIR_USER" ]]; then
         workdir="$_SHELLM_WORKDIR_USER"
     else
-        workdir="$HOME/.shellm/workdirs/$run_name"
+        workdir="$SHELLM_HOME/workdirs/$run_name"
     fi
     mkdir -p "$workdir"
 
