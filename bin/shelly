@@ -50,8 +50,8 @@ iso_timestamp() {
     date +%Y-%m-%dT%H:%M:%S
 }
 
-# Collect vars declared by skills in SKILL.md frontmatter.
-# Scans kernel skills and persona skills for `vars:` lists.
+# Collect env vars declared by skills via metadata.shelllm.requires.env.
+# Scans kernel skills and persona skills for requires.env arrays.
 # Outputs deduplicated var names, one per line.
 collect_skill_vars() {
     local persona_dir="$1"
@@ -62,17 +62,17 @@ collect_skill_vars() {
         [[ -d "$base" ]] || continue
         for skill_dir in "$base"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
-            local in_vars=0
-            while IFS= read -r line; do
-                if [[ "$in_vars" -eq 1 ]]; then
-                    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+([A-Za-z_][A-Za-z_0-9]*) ]]; then
-                        var_names+=("${BASH_REMATCH[1]}")
-                    else
-                        in_vars=0
-                    fi
-                fi
-                [[ "$line" == "vars:" ]] && in_vars=1
-            done < <(sed -n '/^---$/,/^---$/p' "${skill_dir}SKILL.md")
+            local frontmatter
+            frontmatter=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f{print}' "${skill_dir}SKILL.md")
+            [[ -z "$frontmatter" ]] && continue
+            # Extract env array from requires.env (JSON bracket notation)
+            local env_val
+            env_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+env:/{sub(/.*env:[[:space:]]*/, ""); print; exit}')
+            [[ -z "$env_val" ]] && continue
+            local v
+            while IFS= read -r v; do
+                [[ -n "$v" ]] && var_names+=("$v")
+            done < <(printf '%s' "$env_val" | jq -r '.[]' 2>/dev/null)
         done
     done
     # Deduplicate and output
@@ -130,30 +130,23 @@ resolve_persona() {
 ensure_kernel() {
     mkdir -p "$SHELLY_KERNEL_DIR/mem"
     if [[ ! -f "$SHELLY_KERNEL_DIR/mem/SKILL.md" ]]; then
-        cat > "$SHELLY_KERNEL_DIR/mem/SKILL.md" << 'MEMSKILL'
+        # Locate bundled mem skill relative to the real script location
+        local script_dir bundled_skill
+        script_dir="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+        bundled_skill="$script_dir/../skills/mem/SKILL.md"
+        if [[ -f "$bundled_skill" ]]; then
+            cp "$bundled_skill" "$SHELLY_KERNEL_DIR/mem/SKILL.md"
+        else
+            debug "Warning: bundled mem skill not found at $bundled_skill; creating minimal bootstrap"
+            cat > "$SHELLY_KERNEL_DIR/mem/SKILL.md" << 'MEMSKILL'
 ---
 name: mem
 description: Life context and memory system
 ---
-
 # mem — Life context system
-
-My life context is the experience I accumulate by living in the world that is unique to me; my memories, beliefs, life lessons, values, objectives, todos, etc. It is what makes me me; my persona. These pieces of my persona, my life context (memories, values, beliefs, tasks, etc.) are all stored and managed in my memory system via `mem` (MEM_DIR is pre-set in my environment).
-
-Commands I can run:
-  mem add --type TYPE <text>  Save with a type (todo, objective, value, belief, fact, preference, note)
-  mem search <query>          Semantic search across my memories (this is expensive, i can also grep my memories folder)
-  mem list                    List all memories (dates + slugs)
-  mem dump                    Print all memory summaries
-  mem forget <name>           Delete a memory by name or prefix
-  mem edit <name> <text>      Update a memory (or pipe new text via stdin)
-
-Each memory/task/etc. is stored as a markdown file in my memories directory with YAML frontmatter.
-
-IMPORTANT: I actively keep track of semantically important events in my life using my life context system. So I quick to create a new mem anytime something important or memorable or suprising happens.
-
-To create a new piece of life context, I use `mem add`. I can see my most recent memories below or I can use `mem search`.
+Commands: mem add --type TYPE <text> | mem search <query> | mem list | mem dump | mem forget <name> | mem edit <name> <text>
 MEMSKILL
+        fi
         debug "Bootstrapped mem kernel skill"
     fi
 }

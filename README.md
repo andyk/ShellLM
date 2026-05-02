@@ -362,6 +362,8 @@ skills --init my-new-skill
 skills --remove old-skill
 ```
 
+Skills can declare requirements (env vars, binaries, OS) in their YAML frontmatter under `metadata.shelllm.requires`. By default, `skills list` only shows skills whose requirements are met. Use `skills check <name>` to diagnose a specific skill's requirements.
+
 Skills live in `SKILLS_DIR` (default: `~/.skills/`). shelly also has per-session skills in `.shelly/sessions/<id>/skills/`.
 
 ### shelly

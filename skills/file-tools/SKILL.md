@@ -1,6 +1,10 @@
 ---
 name: file-tools
 description: Read, write, edit, and search files using view, put, sub, and glob
+metadata:
+  shelllm:
+    requires:
+      bins: ["view", "put", "sub", "glob"]
 ---
 
 # file-tools

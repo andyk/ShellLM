@@ -63,10 +63,12 @@ debug() {
 # Extract a field from SKILL.md YAML frontmatter.
 # Usage: frontmatter_field <file> <field>
 # Handles unquoted, double-quoted, and single-quoted values.
+# Only reads the first frontmatter block (between first and second ---).
 frontmatter_field() {
     local file="$1" field="$2"
-    sed -n '/^---$/,/^---$/p' "$file" \
+    awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f{print}' "$file" \
         | grep "^${field}:" \
+        | head -1 \
         | sed "s/^${field}:[[:space:]]*//" \
         | sed "s/^[\"']\(.*\)[\"']$/\1/"
 }
@@ -165,6 +167,155 @@ _show_kernel_budget() {
 }
 
 # ---------------------------------------------------------------------------
+# Requirements parsing & checking
+# ---------------------------------------------------------------------------
+
+# Extract metadata.shelllm block from SKILL.md frontmatter as JSON.
+# Supports inline JSON (metadata: {"shelllm": {...}}) and multi-line YAML.
+# Returns JSON: {"requires":{"env":[],"bins":[],"anyBins":[],"os":[]}}
+# Returns "{}" if no metadata.shelllm block found.
+_extract_shelllm_meta() {
+    local file="$1"
+    [[ -f "$file" ]] || { echo '{}'; return; }
+
+    # Extract only the first frontmatter block (between first and second ---)
+    # Using awk instead of sed to avoid capturing --- delimited blocks in the body
+    local frontmatter
+    frontmatter=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f{print}' "$file")
+    [[ -z "$frontmatter" ]] && { echo '{}'; return; }
+
+    # Check if metadata exists at all
+    printf '%s\n' "$frontmatter" | grep -q '^metadata:' || { echo '{}'; return; }
+
+    # Try inline JSON: metadata: {"shelllm": {...}}
+    local meta_inline
+    meta_inline=$(printf '%s\n' "$frontmatter" | grep '^metadata:' | sed 's/^metadata:[[:space:]]*//')
+    if [[ -n "$meta_inline" ]] && printf '%s' "$meta_inline" | jq -e '.shelllm' >/dev/null 2>&1; then
+        printf '%s' "$meta_inline" | jq -c '.shelllm'
+        return
+    fi
+
+    # Multi-line YAML: extract requires fields by grepping indented lines.
+    # Arrays use JSON bracket notation ["a", "b"], so jq can parse them directly.
+    local env_val bins_val anybins_val os_val
+    env_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+env:/{sub(/.*env:[[:space:]]*/, ""); print; exit}')
+    bins_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+bins:/{sub(/.*bins:[[:space:]]*/, ""); print; exit}')
+    anybins_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+anyBins:/{sub(/.*anyBins:[[:space:]]*/, ""); print; exit}')
+    os_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+os:/{sub(/.*os:[[:space:]]*/, ""); print; exit}')
+
+    # If nothing found, return empty
+    if [[ -z "$env_val" && -z "$bins_val" && -z "$anybins_val" && -z "$os_val" ]]; then
+        echo '{}'
+        return
+    fi
+
+    jq -n \
+        --argjson env "${env_val:-[]}" \
+        --argjson bins "${bins_val:-[]}" \
+        --argjson anybins "${anybins_val:-[]}" \
+        --argjson os "${os_val:-[]}" \
+        '{requires: {env: $env, bins: $bins, anyBins: $anybins, os: $os}}'
+}
+
+# Returns 0 if all requirements are met, 1 otherwise. No output.
+# Takes the JSON from _extract_shelllm_meta as $1.
+_requirements_met() {
+    local meta="$1"
+    [[ "$meta" == "{}" || -z "$meta" ]] && return 0
+
+    # Check env vars
+    local var
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        [[ -z "${!var:-}" ]] && return 1
+    done < <(printf '%s' "$meta" | jq -r '(.requires.env // [])[]' 2>/dev/null)
+
+    # Check required bins
+    local bin
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        command -v "$bin" >/dev/null 2>&1 || return 1
+    done < <(printf '%s' "$meta" | jq -r '(.requires.bins // [])[]' 2>/dev/null)
+
+    # Check anyBins (at least one must exist)
+    local any_count=0 any_found=0
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        any_count=$((any_count + 1))
+        command -v "$bin" >/dev/null 2>&1 && any_found=1
+    done < <(printf '%s' "$meta" | jq -r '(.requires.anyBins // [])[]' 2>/dev/null)
+    [[ "$any_count" -gt 0 && "$any_found" -eq 0 ]] && return 1
+
+    # Check OS
+    local os_count
+    os_count=$(printf '%s' "$meta" | jq -r '(.requires.os // []) | length' 2>/dev/null)
+    if [[ "${os_count:-0}" -gt 0 ]]; then
+        local current_os
+        current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+        printf '%s' "$meta" | jq -e --arg os "$current_os" '(.requires.os // []) | index($os) != null' >/dev/null 2>&1 || return 1
+    fi
+
+    return 0
+}
+
+# Returns a comma-separated summary of missing requirements.
+# Takes the JSON from _extract_shelllm_meta as $1.
+_missing_summary() {
+    local meta="$1"
+    [[ "$meta" == "{}" || -z "$meta" ]] && return
+
+    local missing=""
+
+    # Missing env vars
+    local var
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ -z "${!var:-}" ]]; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}${var}"
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.env // [])[]' 2>/dev/null)
+
+    # Missing required bins
+    local bin
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}${bin}"
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.bins // [])[]' 2>/dev/null)
+
+    # Missing anyBins
+    local any_count=0 any_found=0 any_names=""
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        any_count=$((any_count + 1))
+        [[ -n "$any_names" ]] && any_names="$any_names, "
+        any_names="${any_names}${bin}"
+        command -v "$bin" >/dev/null 2>&1 && any_found=1
+    done < <(printf '%s' "$meta" | jq -r '(.requires.anyBins // [])[]' 2>/dev/null)
+    if [[ "$any_count" -gt 0 && "$any_found" -eq 0 ]]; then
+        [[ -n "$missing" ]] && missing="$missing, "
+        missing="${missing}one of [${any_names}]"
+    fi
+
+    # Missing OS
+    local os_count
+    os_count=$(printf '%s' "$meta" | jq -r '(.requires.os // []) | length' 2>/dev/null)
+    if [[ "${os_count:-0}" -gt 0 ]]; then
+        local current_os
+        current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+        if ! printf '%s' "$meta" | jq -e --arg os "$current_os" '(.requires.os // []) | index($os) != null' >/dev/null 2>&1; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}os:${current_os}"
+        fi
+    fi
+
+    printf '%s' "$missing"
+}
+
+# ---------------------------------------------------------------------------
 # Remote management utilities
 # ---------------------------------------------------------------------------
 
@@ -215,13 +366,13 @@ _sync_remote_cache() {
     cache_dir=$(_remote_cache_dir "$remote")
 
     if [[ ! -d "$cache_dir" ]]; then
-        printf "${_dim}  Cloning %s...${_reset}\n" "$remote" >&2
+        printf "${_dim}Cloning %s...${_reset}\n" "$remote" >&2
         git clone --depth 1 -q "$remote" "$cache_dir" 2>/dev/null || {
             warn "Failed to clone remote: $remote"
             return 1
         }
     else
-        printf "${_dim}  Updating %s...${_reset}\n" "$remote" >&2
+        printf "${_dim}Updating %s...${_reset}\n" "$remote" >&2
         git -C "$cache_dir" pull --ff-only -q 2>/dev/null || {
             warn "Failed to update remote: $remote"
             return 1
@@ -300,8 +451,13 @@ _find_skill_in_remotes() {
 # ---------------------------------------------------------------------------
 
 action_list() {
+    local show_all="${1:-0}"
+    local format="${2:-}"
     local found=0
     local dir label skill_dir name desc
+    # Track seen skill names for conflict detection (pipe-delimited for bash 3.2 compat)
+    local _seen_skills="|"
+    local _seen_paths=""
 
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
@@ -309,47 +465,88 @@ action_list() {
 
         for skill_dir in "$dir"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
-            found=1
 
             name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
             desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
             [[ -z "$name" ]] && name=$(basename "$skill_dir")
-            [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
 
+            # Detect conflicts: same skill name from multiple directories
             local skill_path="${skill_dir%/}"
-            printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
-                "$name" "${_dim}${desc}" "$label" "$skill_path"
+            case "$_seen_skills" in
+                *"|${name}|"*)
+                    # Find the earlier path for the warning
+                    local prev_path
+                    prev_path=$(printf '%s\n' "$_seen_paths" | grep "^${name}	" | head -1 | cut -f2)
+                    warn "skill ${_bold}${name}${_reset} found in multiple locations:\n    ${prev_path}\n    ${skill_path}\n  Using the first one. Remove one copy to resolve."
+                    continue
+                    ;;
+            esac
+            _seen_skills="${_seen_skills}${name}|"
+            _seen_paths="${_seen_paths}${name}	${skill_path}
+"
+
+            # Check requirements
+            local meta eligible=1 missing=""
+            meta=$(_extract_shelllm_meta "${skill_dir}SKILL.md")
+            if ! _requirements_met "$meta"; then
+                eligible=0
+                missing=$(_missing_summary "$meta")
+            fi
+
+            # Filter unless --all
+            if [[ "$eligible" -eq 0 && "$show_all" -eq 0 ]]; then
+                continue
+            fi
+
+            found=1
+
+            if [[ "$format" == "prompt" ]]; then
+                printf -- '- %s: %s\n' "$name" "$desc"
+            else
+                [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+
+                if [[ "$eligible" -eq 0 ]]; then
+                    printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset} ${_yellow}(missing: %s)${_reset}\n    ${_dim}%s${_reset}\n" \
+                        "$name" "${_dim}${desc}" "$label" "$missing" "$skill_path"
+                else
+                    printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
+                        "$name" "${_dim}${desc}" "$label" "$skill_path"
+                fi
+            fi
         done
     done < <(_all_skill_dirs)
 
-    if [[ "$found" -eq 0 ]]; then
-        echo "No skills installed." >&2
-        printf "  Run ${_bold}skills --init${_reset} to create one, or ${_bold}skills <query>${_reset} to search.\n" >&2
-    fi
+    if [[ "$format" != "prompt" ]]; then
+        if [[ "$found" -eq 0 ]]; then
+            echo "No skills installed." >&2
+            printf "  Run ${_bold}skills --init${_reset} to create one, or ${_bold}skills <query>${_reset} to search.\n" >&2
+        fi
 
-    # --- Available from remotes ---
-    if [[ -n "$SKILLS_REMOTES" ]]; then
-        # Build pipe-delimited installed names for O(1) lookup (bash 3.2 compat)
-        local installed_names="|"
-        local iname
-        while IFS= read -r iname; do
-            installed_names="${installed_names}${iname}|"
-        done < <(_installed_skill_names)
+        # --- Available from remotes ---
+        if [[ -n "$SKILLS_REMOTES" ]]; then
+            printf "\n${_bold}Available (from remotes)${_reset}\n"
 
-        local remote_found=0
-        local rname rdesc rremote
-        while IFS=$'\t' read -r rname rdesc rremote; do
-            # Skip if already installed
-            case "$installed_names" in
-                *"|${rname}|"*) continue ;;
-            esac
-            if [[ "$remote_found" -eq 0 ]]; then
-                printf "\n${_bold}Available (from remotes)${_reset}\n"
+            # Build pipe-delimited installed names for O(1) lookup (bash 3.2 compat)
+            local installed_names="|"
+            local iname
+            while IFS= read -r iname; do
+                installed_names="${installed_names}${iname}|"
+            done < <(_installed_skill_names)
+
+            local remote_found=0
+            local rname rdesc rremote
+            while IFS=$'\t' read -r rname rdesc rremote; do
+                # Skip if already installed
+                case "$installed_names" in
+                    *"|${rname}|"*) continue ;;
+                esac
                 remote_found=1
-            fi
-            [[ ${#rdesc} -gt 60 ]] && rdesc="${rdesc:0:57}..."
-            printf "  ${_bold}%-20s${_reset} ${_dim}%-60s${_reset} ${_cyan}[remote]${_reset}\n" "$rname" "$rdesc"
-        done < <(_all_remote_skills)
+                [[ ${#rdesc} -gt 60 ]] && rdesc="${rdesc:0:57}..."
+                printf "  ${_bold}%-20s${_reset} ${_dim}%-60s${_reset} ${_cyan}[remote]${_reset}\n" "$rname" "$rdesc"
+            done < <(_all_remote_skills)
+
+            [[ "$remote_found" -eq 0 ]] && printf "  ${_dim}(none)${_reset}\n"
+        fi
     fi
 }
 
@@ -539,6 +736,49 @@ action_install() {
 
     info "Installed: ${_bold}$skill_name${_reset}"
     [[ -n "$skill_desc" ]] && dim "$skill_desc"
+
+    # Show requirements info
+    local meta
+    meta=$(_extract_shelllm_meta "$install_dir/SKILL.md")
+    if [[ "$meta" != "{}" ]]; then
+        # Env vars
+        local has_env=0 var
+        while IFS= read -r var; do
+            [[ -z "$var" ]] && continue
+            if [[ "$has_env" -eq 0 ]]; then
+                printf "\nThis skill requires environment variables:\n"
+                has_env=1
+            fi
+            if [[ -n "${!var:-}" ]]; then
+                printf "  %s  ${_dim}(set)${_reset}\n" "$var"
+            else
+                printf "  %s  ${_yellow}(not set)${_reset}\n" "$var"
+            fi
+        done < <(printf '%s' "$meta" | jq -r '(.requires.env // [])[]' 2>/dev/null)
+
+        if [[ "$has_env" -eq 1 ]]; then
+            printf "\nSet these in your shell environment, e.g.:\n"
+            printf "  export %s=\"...\"\n" "$var"
+            printf "\nOr use your preferred secrets manager:\n"
+            printf "  export %s=\$(op read \"op://Personal/%s/api_key\")\n" "$var" "$skill_name"
+            printf "  export %s=\$(pass show %s/api_key)\n" "$var" "$skill_name"
+        fi
+
+        # Binaries
+        local has_bins=0 bin
+        while IFS= read -r bin; do
+            [[ -z "$bin" ]] && continue
+            if [[ "$has_bins" -eq 0 ]]; then
+                printf "\nRequired binaries:\n"
+                has_bins=1
+            fi
+            if command -v "$bin" >/dev/null 2>&1; then
+                printf "  %s ${_dim}(installed)${_reset}\n" "$bin"
+            else
+                printf "  %s ${_yellow}(not found)${_reset}\n" "$bin"
+            fi
+        done < <(printf '%s' "$meta" | jq -r '((.requires.bins // []) + (.requires.anyBins // []))[]' 2>/dev/null)
+    fi
 }
 
 action_remove() {
@@ -561,10 +801,98 @@ action_remove() {
 
 action_show() {
     local name="$1"
+    local show_requires="${2:-0}"
 
     local skill_dir
     skill_dir=$(find_skill "$name") || die "Skill not found: $name"
-    cat "$skill_dir/SKILL.md"
+
+    if [[ "$show_requires" -eq 1 ]]; then
+        local meta
+        meta=$(_extract_shelllm_meta "$skill_dir/SKILL.md")
+        if [[ "$meta" == "{}" ]]; then
+            printf "No requirements declared.\n"
+        else
+            printf '%s' "$meta" | jq '.'
+        fi
+    else
+        cat "$skill_dir/SKILL.md"
+    fi
+}
+
+action_check() {
+    local name="$1"
+
+    local skill_dir
+    skill_dir=$(find_skill "$name") || die "Skill not found: $name"
+
+    local meta
+    meta=$(_extract_shelllm_meta "$skill_dir/SKILL.md")
+
+    if [[ "$meta" == "{}" ]]; then
+        printf "No requirements declared.\n"
+        return 0
+    fi
+
+    local all_met=0
+
+    # Check env vars
+    local var
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ -n "${!var:-}" ]]; then
+            printf "OK    env  %s\n" "$var"
+        else
+            printf "MISS  env  %s\n" "$var"
+            all_met=1
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.env // [])[]' 2>/dev/null)
+
+    # Check required bins
+    local bin
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        if command -v "$bin" >/dev/null 2>&1; then
+            printf "OK    bin  %s\n" "$bin"
+        else
+            printf "MISS  bin  %s\n" "$bin"
+            all_met=1
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.bins // [])[]' 2>/dev/null)
+
+    # Check anyBins (at least one must exist)
+    local any_count=0 any_found=0
+    local -a any_results=()
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        any_count=$((any_count + 1))
+        if command -v "$bin" >/dev/null 2>&1; then
+            any_results+=("OK    bin  $bin (any)")
+            any_found=1
+        else
+            any_results+=("MISS  bin  $bin (any)")
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.anyBins // [])[]' 2>/dev/null)
+    if [[ "$any_count" -gt 0 ]]; then
+        printf '%s\n' "${any_results[@]}"
+        [[ "$any_found" -eq 0 ]] && all_met=1
+    fi
+
+    # Check OS
+    local current_os os_count
+    current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    os_count=$(printf '%s' "$meta" | jq -r '(.requires.os // []) | length' 2>/dev/null)
+    if [[ "${os_count:-0}" -gt 0 ]]; then
+        if printf '%s' "$meta" | jq -e --arg os "$current_os" '(.requires.os // []) | index($os) != null' >/dev/null 2>&1; then
+            printf "OK    os   %s\n" "$current_os"
+        else
+            local os_list
+            os_list=$(printf '%s' "$meta" | jq -r '(.requires.os // []) | join(", ")' 2>/dev/null)
+            printf "MISS  os   %s (need: %s)\n" "$current_os" "$os_list"
+            all_met=1
+        fi
+    fi
+
+    return $all_met
 }
 
 action_init() {
@@ -852,12 +1180,16 @@ usage() {
 skills — Skills manager for shellm
 
 Usage:
-  skills                                    List all installed skills
-  skills list                               List all installed skills
+  skills                                    List installed skills (eligible only)
+  skills list                               List installed skills (eligible only)
+  skills list --all                         List all skills, including ineligible
+  skills list --format=prompt               List eligible skills in prompt format
   skills search <query>                     Search installed + remote skills
   skills install <name|owner/repo|url|path> Install a skill
   skills remove <name>                      Remove an installed skill
   skills show <name>                        Print a skill's full SKILL.md
+  skills show <name> --requires             Show parsed requirements only
+  skills check <name>                       Check if a skill's requirements are met
   skills init [name]                        Scaffold a new skill in current dir
   skills list-json                          List skills as JSON (for programmatic use)
   skills promote <name>                     Promote a skill to the kernel
@@ -868,6 +1200,9 @@ Usage:
   skills remote remove <url|path>           Remove a skill remote
 
 Options:
+  -a, --all          List all skills including those with unmet requirements
+  --format FORMAT    Output format: default or "prompt" (compact, for system prompts)
+  --requires         Show parsed requirements (with skills show)
   --dir DIR          Use DIR as the skills directory (default: ./.skills)
   --remotes REMOTES  Comma-separated list of remote skill sources
   --project          Target project-level .skills/ instead of local
@@ -877,6 +1212,17 @@ Options:
   -v, --verbose      Verbose/debug mode
   -h, --help         Show help
   --version          Show version
+
+Requirements:
+  Skills can declare requirements in SKILL.md frontmatter under metadata.shelllm:
+    requires:
+      env: ["VAR1", "VAR2"]       All env vars must be set
+      bins: ["curl", "jq"]        All binaries must exist on PATH
+      anyBins: ["gh", "hub"]      At least one must exist on PATH
+      os: ["darwin", "linux"]     Current OS must be in list
+
+  By default, `skills list` only shows skills whose requirements are met.
+  Use `skills check <name>` to diagnose specific requirements.
 
 Environment:
   SKILLS_DIR              Override skills directory (default: ./.skills)
@@ -900,6 +1246,10 @@ main() {
     local force=0
     local init_name=""
     local init_desc=""
+    local show_all=0
+    local format=""
+    local show_requires=0
+    local -a _positional=()
 
     # Parse subcommand first (if present)
     if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
@@ -909,6 +1259,7 @@ main() {
             install)   action="install";  shift ;;
             remove)    action="remove";   shift ;;
             show)      action="show";     shift ;;
+            check)     action="check";    shift ;;
             init)      action="init";     shift ;;
             promote)   action="promote";  shift ;;
             demote)    action="demote";   shift ;;
@@ -943,6 +1294,22 @@ main() {
                 SKILLS_REMOTES="${2:?--remotes requires a value}"
                 shift 2
                 ;;
+            -a|--all)
+                show_all=1
+                shift
+                ;;
+            --format)
+                format="${2:?--format requires a value}"
+                shift 2
+                ;;
+            --format=*)
+                format="${1#--format=}"
+                shift
+                ;;
+            --requires)
+                show_requires=1
+                shift
+                ;;
             --force)
                 force=1
                 shift
@@ -960,6 +1327,7 @@ main() {
             --install)   action="install";  shift ;;
             --remove)    action="remove";   shift ;;
             --show)      action="show";     shift ;;
+            --check)     action="check";    shift ;;
             --list-json) action="list-json"; shift ;;
             --init)      action="init";     shift ;;
             --promote)   action="promote";  shift ;;
@@ -969,40 +1337,43 @@ main() {
                 die "Unknown option: $1 (try skills --help)"
                 ;;
             *)
-                break
+                # Collect positional args without breaking, so trailing flags are still parsed
+                _positional+=("$1")
+                shift
                 ;;
         esac
     done
 
     # Subcommand-style dispatch (e.g. "skills show foo" instead of "skills --show foo")
-    if [[ -z "$action" && $# -gt 0 ]]; then
-        case "$1" in
-            list)      action="list";     shift ;;
-            list-json) action="list-json"; shift ;;
-            install)   action="install";  shift ;;
-            remove)    action="remove";   shift ;;
-            show)      action="show";     shift ;;
-            init)      action="init";     shift ;;
-            promote)   action="promote";  shift ;;
-            demote)    action="demote";   shift ;;
-            kernel)    action="kernel";   shift ;;
-            remote)    action="remote";   shift ;;
+    if [[ -z "$action" && ${#_positional[@]} -gt 0 ]]; then
+        case "${_positional[0]}" in
+            list)      action="list";     _positional=("${_positional[@]:1}") ;;
+            list-json) action="list-json"; _positional=("${_positional[@]:1}") ;;
+            install)   action="install";  _positional=("${_positional[@]:1}") ;;
+            remove)    action="remove";   _positional=("${_positional[@]:1}") ;;
+            show)      action="show";     _positional=("${_positional[@]:1}") ;;
+            check)     action="check";    _positional=("${_positional[@]:1}") ;;
+            init)      action="init";     _positional=("${_positional[@]:1}") ;;
+            promote)   action="promote";  _positional=("${_positional[@]:1}") ;;
+            demote)    action="demote";   _positional=("${_positional[@]:1}") ;;
+            kernel)    action="kernel";   _positional=("${_positional[@]:1}") ;;
+            remote)    action="remote";   _positional=("${_positional[@]:1}") ;;
         esac
     fi
 
-    local remaining="$*"
+    local remaining="${_positional[*]:-}"
 
     case "$action" in
-        list)      action_list ;;
+        list)      action_list "$show_all" "$format" ;;
         list-json) action_list_json ;;
         kernel)    action_kernel ;;
         remote)
-            local remote_sub="${1:-list}"
-            shift 2>/dev/null || true
+            local remote_sub="${_positional[0]:-list}"
+            local remote_arg="${_positional[*]:1}"
             case "$remote_sub" in
                 list)   action_remote_list ;;
-                add)    action_remote_add "$*" ;;
-                remove) action_remote_remove "$*" ;;
+                add)    action_remote_add "$remote_arg" ;;
+                remove) action_remote_remove "$remote_arg" ;;
                 *)      die "Unknown remote subcommand: $remote_sub (try: list, add, remove)" ;;
             esac
             ;;
@@ -1016,7 +1387,11 @@ main() {
             ;;
         show)
             [[ -z "$remaining" ]] && die "show requires a skill name"
-            action_show "$remaining"
+            action_show "$remaining" "$show_requires"
+            ;;
+        check)
+            [[ -z "$remaining" ]] && die "check requires a skill name"
+            action_check "$remaining"
             ;;
         promote)
             [[ -z "$remaining" ]] && die "promote requires a skill name"
@@ -1038,7 +1413,7 @@ main() {
             if [[ -n "$remaining" ]]; then
                 action_search "$remaining"
             else
-                action_list
+                action_list "$show_all" "$format"
             fi
             ;;
     esac

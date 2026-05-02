@@ -11,6 +11,15 @@ set -euo pipefail
 
 die() { echo "shellm-explore: error: $*" >&2; exit 1; }
 
+# Colors (disabled if stdout is not a tty)
+if [[ -t 1 ]]; then
+    _c_tree=$'\033[36m'    # cyan for tree bars
+    _c_hi=$'\033[1;33m'    # bold yellow for >>> target highlight
+    _c_reset=$'\033[0m'
+else
+    _c_tree="" _c_hi="" _c_reset=""
+fi
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -115,48 +124,87 @@ print_tree() {
     local target="$2"
 
     # Find all run records under root (directories containing .shellm/command)
-    # Sort for deterministic output
     local runs
     runs=$(find "$root" -name command -path '*/.shellm/command' | sort)
 
-    # For each run, derive the run dir and compute depth
     local root_depth
     root_depth=$(echo "$root" | tr '/' '\n' | wc -l | tr -d ' ')
 
+    # Collect all entries into parallel arrays
+    local -a depths=() dirs=() names=() sums=()
     while IFS= read -r cmd_file; do
-        # cmd_file is like .../rundir/.shellm/command
         local run_dir
         run_dir="$(dirname "$(dirname "$cmd_file")")"
-
         local run_depth
         run_depth=$(echo "$run_dir" | tr '/' '\n' | wc -l | tr -d ' ')
-        local indent_level=$(( run_depth - root_depth ))
 
-        local indent=""
-        local i
-        for (( i=0; i<indent_level; i++ )); do
-            indent+="  "
-        done
+        local bn
+        bn="$(basename "$run_dir")"
+        local dn
+        if [[ ${#bn} -gt 40 ]]; then dn="${bn:0:37}..."; else dn="$bn"; fi
 
-        local basename
-        basename="$(basename "$run_dir")"
-        # Truncate long basenames
-        local display_name
-        if [[ ${#basename} -gt 40 ]]; then
-            display_name="${basename:0:37}..."
-        else
-            display_name="$basename"
-        fi
-
-        local summary
-        summary="$(get_summary "$run_dir")"
-
-        if [[ "$run_dir" == "$target" ]]; then
-            echo "${indent}>>> ${display_name}: ${summary} <<<"
-        else
-            echo "${indent}${display_name}: ${summary}"
-        fi
+        depths+=("$(( run_depth - root_depth ))")
+        dirs+=("$run_dir")
+        names+=("$dn")
+        sums+=("$(get_summary "$run_dir")")
     done <<< "$runs"
+
+    local count=${#depths[@]}
+
+    # Determine which nodes are the last child at their depth.
+    # A node at depth d is "last" if the next node at depth <= d has depth < d (or doesn't exist).
+    local -a is_last=()
+    local i j
+    for (( i=0; i<count; i++ )); do
+        local d=${depths[$i]} last=1
+        for (( j=i+1; j<count; j++ )); do
+            if [[ ${depths[$j]} -le $d ]]; then
+                [[ ${depths[$j]} -eq $d ]] && last=0
+                break
+            fi
+        done
+        is_last+=("$last")
+    done
+
+    # Print with ASCII tree connectors.
+    # has_more[lvl]=1 means there are still siblings coming at that depth level.
+    local -a has_more=()
+    for (( i=0; i<count; i++ )); do
+        local d=${depths[$i]}
+        local prefix=""
+
+        if [[ $d -gt 0 ]]; then
+            prefix+="  "  # 2-space left margin
+            # Vertical bars for ancestor levels
+            local lvl
+            for (( lvl=1; lvl<d; lvl++ )); do
+                if [[ "${has_more[$lvl]:-0}" -eq 1 ]]; then
+                    prefix+="${_c_tree}│${_c_reset}     "
+                else
+                    prefix+="      "
+                fi
+            done
+            # Connector for this node
+            if [[ ${is_last[$i]} -eq 1 ]]; then
+                prefix+="${_c_tree}└────${_c_reset} "
+            else
+                prefix+="${_c_tree}├────${_c_reset} "
+            fi
+        fi
+
+        # Update sibling tracking for this depth
+        if [[ ${is_last[$i]} -eq 1 ]]; then
+            has_more[$d]=0
+        else
+            has_more[$d]=1
+        fi
+
+        if [[ "${dirs[$i]}" == "$target" ]]; then
+            echo "${_c_hi}>>>${_c_reset} ${prefix}${names[$i]}: ${sums[$i]}"
+        else
+            echo "    ${prefix}${names[$i]}: ${sums[$i]}"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
