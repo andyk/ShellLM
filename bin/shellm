@@ -1287,7 +1287,7 @@ SYSPROMPT
     if [[ "$docker_active" -eq 1 ]]; then
         echo ""
         echo "## Execution environment"
-        echo "Your code runs inside a Docker container ($SHELLM_DOCKER_IMAGE) with bash, python3, jq, and curl pre-installed."
+        echo "Your code runs inside a Docker container ($SHELLM_DOCKER_IMAGE) with bash, python3, jq, and curl pre-installed. You have passwordless sudo — use 'sudo apt-get install -y <pkg>' to install additional packages."
         echo "Host paths (like \$SHELLM_WORKDIR and run record directories) are bind-mounted at the same paths inside the container — they exist and are accessible."
         if [[ "$SHELLM_DOCKER_ACCESS" == "broker" ]]; then
             echo ""

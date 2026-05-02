@@ -413,8 +413,8 @@ cmd_repl() {
     printf 'Loaded persona: %s (%s)\n' "$persona_name" "$persona_dir" >&2
     printf 'Ctrl+C to interrupt, Ctrl+D twice to exit\n' >&2
 
-    # Use shelly_history for readline
-    local history_file="$SHELLY_DIR/shelly_history"
+    # Readline history for up-arrow recall in the REPL
+    local history_file="$persona_dir/repl_history"
     touch "$history_file"
 
     # Load readline history
