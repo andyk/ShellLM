@@ -24,25 +24,145 @@ fi
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+RUNS_DIR="$HOME/.shellm/runs"
 RUN_ID=""
 REPORT=0
 REPORT_MODEL="${SHELLM_MODEL:-claude-opus-4-7}"
+LIST_LIMIT=20
+SUMMARY_WIDTH=85
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --report) REPORT=1; shift ;;
         --model)  REPORT_MODEL="${2:?--model requires a value}"; shift 2 ;;
+        -n)       LIST_LIMIT="${2:?-n requires a number}"; shift 2 ;;
+        -w)       SUMMARY_WIDTH="${2:?-w requires a number}"; shift 2 ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: shellm-explore [RUN_ID] [options]
+
+Explore and visualize shellm run trees. With no arguments, lists recent runs.
+
+Arguments:
+  RUN_ID              Run directory path, name prefix, or hex ID portion
+
+Options:
+  -n N                Number of runs to list (default: 20, 0 for all)
+  -w N                Truncate summaries to N characters (default: 70, 0 for no limit)
+  --report            Generate an LLM-powered analysis of the run tree
+  --model MODEL       Model for report generation (default: $SHELLM_MODEL or claude-opus-4-7)
+  -h, --help          Show this help
+
+Examples:
+  shellm-explore                           # list recent runs
+  shellm-explore -n 5                      # list 5 most recent runs
+  shellm-explore 8cdb3d26                  # show tree for a run
+  shellm-explore 8cdb3d26 -w 60           # tree with short summaries
+  shellm-explore 8cdb3d26 --report         # generate analysis report
+EOF
+            exit 0
+            ;;
         -*)       die "Unknown option: $1" ;;
         *)        RUN_ID="$1"; shift ;;
     esac
 done
 
-[[ -n "$RUN_ID" ]] || die "Usage: shellm-explore <RUN_ID> [--report] [--model MODEL]"
+# ---------------------------------------------------------------------------
+# Get summary line for a run directory
+# ---------------------------------------------------------------------------
+
+get_summary() {
+    local dir="$1"
+    local raw
+    if [[ -f "$dir/.shellm/context.md" ]]; then
+        raw=$(sed -n '2p' "$dir/.shellm/context.md")
+    elif [[ -f "$dir/.shellm/command" ]]; then
+        raw=$(cut -c1-200 "$dir/.shellm/command")
+    else
+        raw="(no summary)"
+    fi
+    if [[ "$SUMMARY_WIDTH" -gt 0 && ${#raw} -gt "$SUMMARY_WIDTH" ]]; then
+        raw="${raw:0:$(( SUMMARY_WIDTH - 3 ))}..."
+    fi
+    printf '%s' "$raw"
+}
+
+# ---------------------------------------------------------------------------
+# List runs (no RUN_ID given)
+# ---------------------------------------------------------------------------
+
+list_runs() {
+    local limit="$1"
+    [[ -d "$RUNS_DIR" ]] || die "No runs directory: $RUNS_DIR"
+
+    # Top-level runs only (direct children of runs_dir), newest first
+    local dirs
+    dirs=$(find "$RUNS_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r)
+    [[ -z "$dirs" ]] && { echo "No runs found."; return; }
+
+    local count=0
+    while IFS= read -r run_dir; do
+        [[ -f "$run_dir/.shellm/command" ]] || continue
+        if [[ "$limit" -gt 0 && "$count" -ge "$limit" ]]; then break; fi
+
+        local name
+        name="$(basename "$run_dir")"
+
+        # Parse timestamp and hex from name: YYYY-MM-DD-HH-MM-SS_HEXID_slug
+        local ts hex slug
+        ts="${name:0:19}"                          # 2026-04-23-23-15-50
+        hex="${name:20:8}"                         # 8cdb3d26
+        slug="${name:29}"                          # the-rest-of-the-name
+        # Format timestamp for display: YYYY-MM-DD HH:MM
+        ts="${ts:0:10} ${ts:11:2}:${ts:14:2}"
+
+        # Count sub-runs and measure max depth
+        local sub_count max_depth
+        sub_count=$(find "$run_dir" -mindepth 3 -name command -path '*/.shellm/command' 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$sub_count" -gt 0 ]]; then
+            local root_components
+            root_components=$(echo "$run_dir" | tr '/' '\n' | wc -l | tr -d ' ')
+            max_depth=$(find "$run_dir" -mindepth 3 -name command -path '*/.shellm/command' 2>/dev/null \
+                | while IFS= read -r f; do
+                    d=$(dirname "$(dirname "$f")")
+                    echo "$d" | tr '/' '\n' | wc -l | tr -d ' '
+                done | sort -rn | head -1)
+            max_depth=$(( max_depth - root_components ))
+        fi
+
+        local summary
+        summary="$(get_summary "$run_dir")"
+
+        local tree_indicator=""
+        if [[ "$sub_count" -gt 0 ]]; then
+            if [[ "$max_depth" -gt 1 ]]; then
+                tree_indicator=" ${_c_tree}[${sub_count} sub, depth ${max_depth}]${_c_reset}"
+            else
+                tree_indicator=" ${_c_tree}[${sub_count} sub]${_c_reset}"
+            fi
+        fi
+
+        printf "${_c_hi}%s${_c_reset}  %s%s\n" "$hex" "$ts" "$tree_indicator"
+        printf "    %s\n" "$summary"
+
+        count=$(( count + 1 ))
+    done <<< "$dirs"
+
+    local total
+    total=$(echo "$dirs" | grep -c . || true)
+    if [[ "$limit" -gt 0 && "$total" -gt "$limit" ]]; then
+        printf "\n(%d of %d runs shown, use -n 0 for all)\n" "$limit" "$total"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Resolve & explore a specific run
+# ---------------------------------------------------------------------------
 
 # Resolve RUN_ID: absolute/relative path, name prefix match, or hex portion match
 resolve_run_id() {
     local input="$1"
-    local runs_dir="$HOME/.shellm/runs"
+    local runs_dir="$RUNS_DIR"
 
     # 1. Direct path (absolute or relative)
     if [[ -d "$input" && -f "$input/.shellm/command" ]]; then
@@ -83,6 +203,12 @@ resolve_run_id() {
     return 1
 }
 
+# If no RUN_ID, list runs and exit
+if [[ -z "$RUN_ID" ]]; then
+    list_runs "$LIST_LIMIT"
+    exit 0
+fi
+
 _run_input="$RUN_ID"
 RUN_ID="$(resolve_run_id "$RUN_ID")" || die "No matching run found: $_run_input"
 
@@ -99,21 +225,6 @@ find_root() {
 }
 
 ROOT="$(find_root "$RUN_ID")"
-
-# ---------------------------------------------------------------------------
-# Get summary line for a run directory
-# ---------------------------------------------------------------------------
-
-get_summary() {
-    local dir="$1"
-    if [[ -f "$dir/.shellm/context.md" ]]; then
-        sed -n '2p' "$dir/.shellm/context.md"
-    elif [[ -f "$dir/.shellm/command" ]]; then
-        cut -c1-80 "$dir/.shellm/command"
-    else
-        echo "(no summary)"
-    fi
-}
 
 # ---------------------------------------------------------------------------
 # Tree visualization
@@ -140,12 +251,12 @@ print_tree() {
 
         local bn
         bn="$(basename "$run_dir")"
-        local dn
-        if [[ ${#bn} -gt 40 ]]; then dn="${bn:0:37}..."; else dn="$bn"; fi
+        # Extract hex ID from name: YYYY-MM-DD-HH-MM-SS_HEXID_slug
+        local hex="${bn:20:8}"
 
         depths+=("$(( run_depth - root_depth ))")
         dirs+=("$run_dir")
-        names+=("$dn")
+        names+=("$hex")
         sums+=("$(get_summary "$run_dir")")
     done <<< "$runs"
 
@@ -200,9 +311,9 @@ print_tree() {
         fi
 
         if [[ "${dirs[$i]}" == "$target" ]]; then
-            echo "${_c_hi}>>>${_c_reset} ${prefix}${names[$i]}: ${sums[$i]}"
+            echo "${_c_hi}>>>${_c_reset} ${prefix}${_c_hi}${names[$i]}${_c_reset}: ${sums[$i]}"
         else
-            echo "    ${prefix}${names[$i]}: ${sums[$i]}"
+            echo "    ${prefix}${_c_hi}${names[$i]}${_c_reset}: ${sums[$i]}"
         fi
     done
 }
