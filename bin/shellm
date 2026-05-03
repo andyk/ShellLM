@@ -221,8 +221,7 @@ _shellm_time() {
 # traj_dir is <rundir>/.shellm/traj
 traj_append_step() {
     local traj_dir="$1"
-    shift
-    local json="$1"
+    local json="$2"
     printf '%s' "$json" | traj append "$traj_dir"
 }
 
@@ -1210,17 +1209,55 @@ IMPORTANT: End your response with exactly ONE ```bash code block. Your response 
 - When you're ready, end your response with a single ```bash fenced code block
 - Your code is executed in a bash subprocess
 - You see the stdout/stderr output from execution
-- Break down problems and recursively call a sub-instances of shellm to make progress
 - You will be called iteratively until you have the answer, then signal completion
 - You have all typical shell tools at your disposal
 - You have full access to a local filesystem to use as you see fit
+
+## Sub-runs: your most powerful tool
+You can spawn nested shellm instances to parallelize work, explore alternatives, or delegate sub-problems. Each sub-run gets its own context, iteration budget, and (optionally) its own Docker container.
+
+When to use sub-runs:
+- **Explore in parallel**: try 2-3 different approaches simultaneously and pick the winner
+- **Delegate sub-problems**: break complex work into independent pieces that run concurrently
+- **Research without polluting context**: have a sub-run investigate something and report back
+- **Verify your work**: spawn a sub-run to independently check your solution
+
+How to spawn a sub-run:
+```bash
+shellm "Implement approach A: <detailed description>" > /tmp/approach_a.txt &
+shellm "Implement approach B: <detailed description>" > /tmp/approach_b.txt &
+wait
+# Compare results, pick the best
+```
+
+Pass context to sub-runs with `-f FILE` or via stdin. Always give sub-runs a clear, self-contained task description — they have no memory of your conversation.
+
+Monitor running sub-runs via their trajectory:
+```bash
+# List child run directories
+ls "$SHELLM_RUNDIR"/*/
+# Inspect a sub-run's progress
+context "$SHELLM_RUNDIR/<child-run>/.shellm/traj" --tail 5
+```
+
+## Never block — background long-running work
+Commands that take a long time (compilation, training, downloads, servers) should run in the background so you can keep thinking and doing other work:
+```bash
+# Start a long build in tmux
+tmux new-session -d -s build "make -j4 > /tmp/build.log 2>&1"
+# Do other work while it builds...
+# Check on it later
+tmux capture-pane -t build -p | tail -5
+```
+
+Don't wait idle for slow commands. Start them, move on to other work, and check back.
 
 ## Available tools
 - You have all the standard tools available on Linux/Unix based systems
 - Standard shell: cd, ls, grep, cat, rm, cp, mv, mkdir, echo, curl, find, etc.
 - Text processing: grep, awk, sed, wc, sort, uniq, head, tail, cut, tr, jq, etc.
 - File tools: view (read with line numbers), sub (exact-string edit), put (atomic write), glob (git-aware file search)
-- Recursive self-calling: you can recursively make shellm sub-calls
+- Recursive self-calling: spawn shellm sub-runs for parallelism and delegation
 
 ## Trajectory and context
 The trajectory is the lossless record of this run stored at `$SHELLM_RUNDIR/.shellm/traj/`. Your conversation history is presented as multi-turn messages (your reasoning as assistant, execution output as user) produced by `context`. Large outputs may be truncated with a stub.
@@ -1257,6 +1294,8 @@ SYSPROMPT
 - Start by inspecting the existing environment before making changes.
 - Do not print environment variables wholesale. Avoid `env`, `printenv`, or `set` unless the user explicitly asks for them.
 - When you use `shellm` to create a nested run always include a summary of the bigger picture in the context you pass it so that it knows how it fits in
+- Prefer parallel sub-runs over sequential iteration when you have multiple approaches to try. Spawn them, do other work, then compare results.
+- Never sit idle waiting for a slow command. Background it and keep working.
 - Your code runs with stdin connected to /dev/null. Interactive prompts
     (password, confirmation, etc.) will get immediate EOF and fail. Always
     use non-interactive flags: --yes, -y, --force, --batch, etc.
