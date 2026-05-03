@@ -221,8 +221,7 @@ _shellm_time() {
 # traj_dir is <rundir>/.shellm/traj
 traj_append_step() {
     local traj_dir="$1"
-    shift
-    local json="$1"
+    local json="$2"
     printf '%s' "$json" | traj append "$traj_dir"
 }
 
